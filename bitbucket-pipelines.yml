@@ -1,0 +1,21 @@
+# This is a sample build configuration for Java (Gradle).
+# Check our guides at https://confluence.atlassian.com/x/zd-5Mw for more examples.
+# Only use spaces to indent your .yml configuration.
+# -----
+# You can specify a custom docker image from Docker Hub as your build environment.
+image: docker
+options:
+  docker: true
+pipelines:
+  default:
+    - step:
+        size: 2x
+        script:
+        # Registry Login
+        - docker login -u $DOCKER_HUB_USERNAME -p $DOCKER_HUB_PASSWORD
+        # Build
+        - sh ./build-docker.sh
+definitions:
+  services:
+    docker:
+      memory: 4096 
