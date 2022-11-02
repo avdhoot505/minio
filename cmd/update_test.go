@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -56,22 +55,14 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 		tag    string
 		errStr string
 	}{
-		{
-			time.Date(2017, time.September, 29, 19, 16, 56, 0, utcLoc),
-			"RELEASE.2017-09-29T19-16-56Z", "",
-		},
-		{
-			time.Date(2017, time.August, 5, 0, 0, 53, 0, utcLoc),
-			"RELEASE.2017-08-05T00-00-53Z", "",
-		},
-		{
-			time.Now().UTC(), "2017-09-29T19:16:56Z",
-			"2017-09-29T19:16:56Z is not a valid release tag",
-		},
-		{
-			time.Now().UTC(), "DEVELOPMENT.GOGET",
-			"DEVELOPMENT.GOGET is not a valid release tag",
-		},
+		{time.Date(2017, time.September, 29, 19, 16, 56, 0, utcLoc),
+			"RELEASE.2017-09-29T19-16-56Z", ""},
+		{time.Date(2017, time.August, 5, 0, 0, 53, 0, utcLoc),
+			"RELEASE.2017-08-05T00-00-53Z", ""},
+		{time.Now().UTC(), "2017-09-29T19:16:56Z",
+			"2017-09-29T19:16:56Z is not a valid release tag"},
+		{time.Now().UTC(), "DEVELOPMENT.GOGET",
+			"DEVELOPMENT.GOGET is not a valid release tag"},
 	}
 	for i, testCase := range testCases {
 		if testCase.errStr != "" {
@@ -88,20 +79,20 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 			t.Errorf("Test %d: Expected %v but got %v", i+1, testCase.t, tagTime)
 		}
 	}
+
 }
 
 func TestDownloadURL(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
+	sci := os.Getenv("MINIO_CI_CD")
+
+	os.Setenv("MINIO_CI_CD", "")
+	defer os.Setenv("MINIO_CI_CD", sci)
 
 	minioVersion1 := releaseTimeToReleaseTag(UTCNow())
 	durl := getDownloadURL(minioVersion1)
 	if IsDocker() {
-		if durl != "podman pull quay.io/minio/minio:"+minioVersion1 {
-			t.Errorf("Expected %s, got %s", "podman pull quay.io/minio/minio:"+minioVersion1, durl)
+		if durl != "docker pull minio/minio:"+minioVersion1 {
+			t.Errorf("Expected %s, got %s", "docker pull minio/minio:"+minioVersion1, durl)
 		}
 	} else {
 		if runtime.GOOS == "windows" {
@@ -159,8 +150,8 @@ func TestUserAgent(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		sci := globalIsCICD
-		globalIsCICD = false
+		sci := os.Getenv("MINIO_CI_CD")
+		os.Setenv("MINIO_CI_CD", "")
 
 		os.Setenv(testCase.envName, testCase.envValue)
 		if testCase.envName == "MESOS_CONTAINER_NAME" {
@@ -169,12 +160,12 @@ func TestUserAgent(t *testing.T) {
 		str := getUserAgent(testCase.mode)
 		expectedStr := testCase.expectedStr
 		if IsDocker() {
-			expectedStr = strings.ReplaceAll(expectedStr, "; source", "; docker; source")
+			expectedStr = strings.Replace(expectedStr, "; source", "; docker; source", -1)
 		}
 		if str != expectedStr {
 			t.Errorf("Test %d: expected: %s, got: %s", i+1, expectedStr, str)
 		}
-		globalIsCICD = sci
+		os.Setenv("MINIO_CI_CD", sci)
 		os.Unsetenv("MARATHON_APP_LABEL_DCOS_PACKAGE_VERSION")
 		os.Unsetenv(testCase.envName)
 	}
@@ -182,11 +173,9 @@ func TestUserAgent(t *testing.T) {
 
 // Tests if the environment we are running is in DCOS.
 func TestIsDCOS(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
+	sci := os.Getenv("MINIO_CI_CD")
+	os.Setenv("MINIO_CI_CD", "")
+	defer os.Setenv("MINIO_CI_CD", sci)
 
 	os.Setenv("MESOS_CONTAINER_NAME", "mesos-1111")
 	dcos := IsDCOS()
@@ -203,11 +192,9 @@ func TestIsDCOS(t *testing.T) {
 
 // Tests if the environment we are running is in kubernetes.
 func TestIsKubernetes(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
+	sci := os.Getenv("MINIO_CI_CD")
+	os.Setenv("MINIO_CI_CD", "")
+	defer os.Setenv("MINIO_CI_CD", sci)
 
 	os.Setenv("KUBERNETES_SERVICE_HOST", "10.11.148.5")
 	kubernetes := IsKubernetes()
@@ -228,7 +215,7 @@ func TestGetHelmVersion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Unable to create temporary file. %s", err)
 		}
-		if _, err = tmpfile.WriteString(content); err != nil {
+		if _, err = tmpfile.Write([]byte(content)); err != nil {
 			t.Fatalf("Unable to create temporary file. %s", err)
 		}
 		if err = tmpfile.Close(); err != nil {
@@ -311,29 +298,22 @@ func TestDownloadReleaseData(t *testing.T) {
 func TestParseReleaseData(t *testing.T) {
 	releaseTime, _ := releaseTagToReleaseTime("RELEASE.2016-10-07T01-16-39Z")
 	testCases := []struct {
-		data                string
-		expectedResult      time.Time
-		expectedSha256hex   string
-		expectedReleaseInfo string
-		expectedErr         bool
+		data              string
+		expectedResult    time.Time
+		expectedSha256hex string
+		expectedErr       bool
 	}{
-		{"more than two fields", time.Time{}, "", "", true},
-		{"more than", time.Time{}, "", "", true},
-		{"more than.two.fields", time.Time{}, "", "", true},
-		{"more minio.RELEASE.fields", time.Time{}, "", "", true},
-		{"more minio.RELEASE.2016-10-07T01-16-39Z", time.Time{}, "", "", true},
-		{
-			"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d",
-			"minio.RELEASE.2016-10-07T01-16-39Z", false,
-		},
-		{
-			"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z.customer-hotfix\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d",
-			"minio.RELEASE.2016-10-07T01-16-39Z.customer-hotfix", false,
-		},
+		{"more than two fields", time.Time{}, "", true},
+		{"more than", time.Time{}, "", true},
+		{"more than.two.fields", time.Time{}, "", true},
+		{"more minio.RELEASE.fields", time.Time{}, "", true},
+		{"more minio.RELEASE.2016-10-07T01-16-39Z", time.Time{}, "", true},
+		{"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d", false},
+		{"fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z.customer-hotfix\n", releaseTime, "fbe246edbd382902db9a4035df7dce8cb441357d", false},
 	}
 
 	for i, testCase := range testCases {
-		sha256Sum, result, releaseInfo, err := parseReleaseData(testCase.data)
+		sha256Sum, result, err := parseReleaseData(testCase.data)
 		if !testCase.expectedErr {
 			if err != nil {
 				t.Errorf("error case %d: expected no error, got: %v", i+1, err)
@@ -347,9 +327,6 @@ func TestParseReleaseData(t *testing.T) {
 			}
 			if !testCase.expectedResult.Equal(result) {
 				t.Errorf("case %d: result: expected: %v, got: %v", i+1, testCase.expectedResult, result)
-			}
-			if testCase.expectedReleaseInfo != releaseInfo {
-				t.Errorf("case %d: result: expected: %v, got: %v", i+1, testCase.expectedReleaseInfo, releaseInfo)
 			}
 		}
 	}

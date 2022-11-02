@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -178,12 +177,14 @@ func TestValidateV2AuthHeader(t *testing.T) {
 		// Test case - 1.
 		// Case with empty V2AuthString.
 		{
+
 			authString:    "",
 			expectedError: ErrAuthHeaderEmpty,
 		},
 		// Test case - 2.
 		// Test case with `signV2Algorithm` ("AWS") not being the prefix.
 		{
+
 			authString:    "NoV2Prefix",
 			expectedError: ErrSignatureVersionNotSupported,
 		},
@@ -192,24 +193,28 @@ func TestValidateV2AuthHeader(t *testing.T) {
 		// below is the correct format of V2 Authorization header.
 		// Authorization = "AWS" + " " + AWSAccessKeyId + ":" + Signature
 		{
+
 			authString:    signV2Algorithm,
 			expectedError: ErrMissingFields,
 		},
 		// Test case - 4.
 		// Test case with signature part missing.
 		{
+
 			authString:    fmt.Sprintf("%s %s", signV2Algorithm, accessID),
 			expectedError: ErrMissingFields,
 		},
 		// Test case - 5.
 		// Test case with wrong accessID.
 		{
+
 			authString:    fmt.Sprintf("%s %s:%s", signV2Algorithm, "InvalidAccessID", "signature"),
 			expectedError: ErrInvalidAccessKeyID,
 		},
 		// Test case - 6.
 		// Case with right accessID and format.
 		{
+
 			authString:    fmt.Sprintf("%s %s:%s", signV2Algorithm, accessID, "signature"),
 			expectedError: ErrNone,
 		},
@@ -217,6 +222,7 @@ func TestValidateV2AuthHeader(t *testing.T) {
 
 	for i, testCase := range testCases {
 		t.Run(fmt.Sprintf("Case %d AuthStr \"%s\".", i+1, testCase.authString), func(t *testing.T) {
+
 			req := &http.Request{
 				Header: make(http.Header),
 				URL:    &url.URL{},
@@ -229,6 +235,7 @@ func TestValidateV2AuthHeader(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestDoesPolicySignatureV2Match(t *testing.T) {
@@ -258,7 +265,7 @@ func TestDoesPolicySignatureV2Match(t *testing.T) {
 		formValues.Set("Awsaccesskeyid", test.accessKey)
 		formValues.Set("Signature", test.signature)
 		formValues.Set("Policy", test.policy)
-		_, errCode := doesPolicySignatureV2Match(formValues)
+		errCode := doesPolicySignatureV2Match(formValues)
 		if errCode != test.errCode {
 			t.Fatalf("(%d) expected to get %s, instead got %s", i+1, niceError(test.errCode), niceError(errCode))
 		}

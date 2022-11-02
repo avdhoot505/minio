@@ -1,23 +1,24 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2017-2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -33,11 +34,12 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/internal/config"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/mountinfo"
-	"github.com/minio/pkg/env"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/cmd/config"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/env"
+	"github.com/minio/minio/pkg/mountinfo"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
 // EndpointType - enum for endpoint type.
@@ -197,27 +199,13 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 // PoolEndpoints represent endpoints in a given pool
 // along with its setCount and setDriveCount.
 type PoolEndpoints struct {
-	// indicates if endpoints are provided in non-ellipses style
-	Legacy       bool
 	SetCount     int
 	DrivesPerSet int
 	Endpoints    Endpoints
-	CmdLine      string
 }
 
 // EndpointServerPools - list of list of endpoints
 type EndpointServerPools []PoolEndpoints
-
-// GetPoolIdx return pool index
-func (l EndpointServerPools) GetPoolIdx(pool string) int {
-	for id, ep := range globalEndpoints {
-		if ep.CmdLine != pool {
-			continue
-		}
-		return id
-	}
-	return -1
-}
 
 // GetLocalPoolIdx returns the pool which endpoint belongs to locally.
 // if ep is remote this code will return -1 poolIndex
@@ -232,13 +220,6 @@ func (l EndpointServerPools) GetLocalPoolIdx(ep Endpoint) int {
 		}
 	}
 	return -1
-}
-
-// Legacy returns 'true' if the MinIO server commandline was
-// provided with no ellipses pattern, those are considered
-// legacy deployments.
-func (l EndpointServerPools) Legacy() bool {
-	return len(l) == 1 && l[0].Legacy
 }
 
 // Add add pool endpoints
@@ -263,7 +244,7 @@ func (l *EndpointServerPools) Add(zeps PoolEndpoints) error {
 func (l EndpointServerPools) Localhost() string {
 	for _, ep := range l {
 		for _, endpoint := range ep.Endpoints {
-			if endpoint.IsLocal && endpoint.Host != "" {
+			if endpoint.IsLocal {
 				u := &url.URL{
 					Scheme: endpoint.Scheme,
 					Host:   endpoint.Host,
@@ -272,24 +253,7 @@ func (l EndpointServerPools) Localhost() string {
 			}
 		}
 	}
-	host := globalMinioHost
-	if host == "" {
-		host = sortIPs(localIP4.ToSlice())[0]
-	}
-	return fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(host, globalMinioPort))
-}
-
-// LocalDisksPaths returns the disk paths of the local disks
-func (l EndpointServerPools) LocalDisksPaths() []string {
-	var disks []string
-	for _, ep := range l {
-		for _, endpoint := range ep.Endpoints {
-			if endpoint.IsLocal {
-				disks = append(disks, endpoint.Path)
-			}
-		}
-	}
-	return disks
+	return ""
 }
 
 // FirstLocal returns true if the first endpoint is local.
@@ -395,6 +359,27 @@ func (endpoints Endpoints) GetAllStrings() (all []string) {
 	return
 }
 
+func hostResolveToLocalhost(endpoint Endpoint) bool {
+	hostIPs, err := getHostIP(endpoint.Hostname())
+	if err != nil {
+		// Log the message to console about the host resolving
+		reqInfo := (&logger.ReqInfo{}).AppendTags(
+			"host",
+			endpoint.Hostname(),
+		)
+		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+		logger.LogIf(ctx, err, logger.Application)
+		return false
+	}
+	var loopback int
+	for _, hostIP := range hostIPs.ToSlice() {
+		if net.ParseIP(hostIP).IsLoopback() {
+			loopback++
+		}
+	}
+	return loopback == len(hostIPs)
+}
+
 func (endpoints Endpoints) atleastOneEndpointLocal() bool {
 	for _, endpoint := range endpoints {
 		if endpoint.IsLocal {
@@ -407,6 +392,7 @@ func (endpoints Endpoints) atleastOneEndpointLocal() bool {
 // UpdateIsLocal - resolves the host and discovers the local host.
 func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 	orchestrated := IsDocker() || IsKubernetes()
+	k8sReplicaSet := IsKubernetesReplicaSet()
 
 	var epsResolved int
 	var foundLocal bool
@@ -439,6 +425,24 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 					endpoints[i].Hostname(),
 				)
 
+				if k8sReplicaSet && hostResolveToLocalhost(endpoints[i]) {
+					err := fmt.Errorf("host %s resolves to 127.*, DNS incorrectly configured retrying",
+						endpoints[i])
+					// time elapsed
+					timeElapsed := time.Since(startTime)
+					// log error only if more than 1s elapsed
+					if timeElapsed > time.Second {
+						reqInfo.AppendTags("elapsedTime",
+							humanize.RelTime(startTime,
+								startTime.Add(timeElapsed),
+								"elapsed",
+								""))
+						ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+						logger.LogIf(ctx, err, logger.Application)
+					}
+					continue
+				}
+
 				// return err if not Docker or Kubernetes
 				// We use IsDocker() to check for Docker environment
 				// We use IsKubernetes() to check for Kubernetes environment
@@ -467,6 +471,36 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 				} else {
 					resolvedList[i] = true
 					endpoints[i].IsLocal = isLocal
+					if k8sReplicaSet && !endpoints.atleastOneEndpointLocal() && !foundPrevLocal {
+						// In replicated set in k8s deployment, IPs might
+						// get resolved for older IPs, add this code
+						// to ensure that we wait for this server to
+						// participate atleast one disk and be local.
+						//
+						// In special cases for replica set with expanded
+						// pool setups we need to make sure to provide
+						// value of foundPrevLocal from pool1 if we already
+						// found a local setup. Only if we haven't found
+						// previous local we continue to wait to look for
+						// atleast one local.
+						resolvedList[i] = false
+						// time elapsed
+						err := fmt.Errorf("no endpoint is local to this host: %s", endpoints[i])
+						timeElapsed := time.Since(startTime)
+						// log error only if more than 1s elapsed
+						if timeElapsed > time.Second {
+							reqInfo.AppendTags("elapsedTime",
+								humanize.RelTime(startTime,
+									startTime.Add(timeElapsed),
+									"elapsed",
+									"",
+								))
+							ctx := logger.SetReqInfo(GlobalContext,
+								reqInfo)
+							logger.LogIf(ctx, err, logger.Application)
+						}
+						continue
+					}
 					epsResolved++
 					if !foundLocal {
 						foundLocal = isLocal
@@ -518,7 +552,6 @@ func NewEndpoints(args ...string) (endpoints Endpoints, err error) {
 		}
 
 		// All endpoints have to be same type and scheme if applicable.
-		//nolint:gocritic
 		if i == 0 {
 			endpointType = endpoint.Type()
 			scheme = endpoint.Scheme
@@ -643,33 +676,20 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		}
 	}
 
-	orchestrated := IsKubernetes() || IsDocker()
-	if !orchestrated {
-		// Check whether same path is not used in endpoints of a host on different port.
-		// Only verify this on baremetal setups, DNS is not available in orchestrated
-		// environments so we can't do much here.
-		{
-			pathIPMap := make(map[string]set.StringSet)
-			hostIPCache := make(map[string]set.StringSet)
-			for _, endpoint := range endpoints {
-				host := endpoint.Hostname()
-				hostIPSet, ok := hostIPCache[host]
-				if !ok {
-					hostIPSet, err = getHostIP(host)
-					if err != nil {
-						return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("host '%s' cannot resolve: %s", host, err))
-					}
-					hostIPCache[host] = hostIPSet
+	// Check whether same path is not used in endpoints of a host on different port.
+	{
+		pathIPMap := make(map[string]set.StringSet)
+		for _, endpoint := range endpoints {
+			host := endpoint.Hostname()
+			hostIPSet, _ := getHostIP(host)
+			if IPSet, ok := pathIPMap[endpoint.Path]; ok {
+				if !IPSet.Intersection(hostIPSet).IsEmpty() {
+					return endpoints, setupType,
+						config.ErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("path '%s' can not be served by different port on same address", endpoint.Path))
 				}
-				if IPSet, ok := pathIPMap[endpoint.Path]; ok {
-					if !IPSet.Intersection(hostIPSet).IsEmpty() {
-						return endpoints, setupType,
-							config.ErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("same path '%s' can not be served by different port on same address", endpoint.Path))
-					}
-					pathIPMap[endpoint.Path] = IPSet.Union(hostIPSet)
-				} else {
-					pathIPMap[endpoint.Path] = hostIPSet
-				}
+				pathIPMap[endpoint.Path] = IPSet.Union(hostIPSet)
+			} else {
+				pathIPMap[endpoint.Path] = hostIPSet
 			}
 		}
 	}
@@ -741,7 +761,7 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 // the first element from the set of peers which indicate that
 // they are local. There is always one entry that is local
 // even with repeated server endpoints.
-func GetLocalPeer(endpointServerPools EndpointServerPools, host, port string) (localPeer string) {
+func GetLocalPeer(endpointServerPools EndpointServerPools) (localPeer string) {
 	peerSet := set.NewStringSet()
 	for _, ep := range endpointServerPools {
 		for _, endpoint := range ep.Endpoints {
@@ -756,11 +776,11 @@ func GetLocalPeer(endpointServerPools EndpointServerPools, host, port string) (l
 	if peerSet.IsEmpty() {
 		// Local peer can be empty in FS or Erasure coded mode.
 		// If so, return globalMinioHost + globalMinioPort value.
-		if host != "" {
-			return net.JoinHostPort(host, port)
+		if globalMinioHost != "" {
+			return net.JoinHostPort(globalMinioHost, globalMinioPort)
 		}
 
-		return net.JoinHostPort("127.0.0.1", port)
+		return net.JoinHostPort("127.0.0.1", globalMinioPort)
 	}
 	return peerSet.ToSlice()[0]
 }
@@ -771,6 +791,72 @@ func GetProxyEndpointLocalIndex(proxyEps []ProxyEndpoint) int {
 		if pep.IsLocal {
 			return i
 		}
+	}
+	return -1
+}
+
+func httpDo(clnt *http.Client, req *http.Request, f func(*http.Response, error) error) error {
+	ctx, cancel := context.WithTimeout(GlobalContext, 200*time.Millisecond)
+	defer cancel()
+
+	// Run the HTTP request in a goroutine and pass the response to f.
+	c := make(chan error, 1)
+	req = req.WithContext(ctx)
+	go func() { c <- f(clnt.Do(req)) }()
+	select {
+	case <-ctx.Done():
+		<-c // Wait for f to return.
+		return ctx.Err()
+	case err := <-c:
+		return err
+	}
+}
+
+func getOnlineProxyEndpointIdx() int {
+	type reqIndex struct {
+		Request *http.Request
+		Idx     int
+	}
+
+	proxyRequests := make(map[*http.Client]reqIndex, len(globalProxyEndpoints))
+	for i, proxyEp := range globalProxyEndpoints {
+		proxyEp := proxyEp
+		serverURL := &url.URL{
+			Scheme: proxyEp.Scheme,
+			Host:   proxyEp.Host,
+			Path:   pathJoin(healthCheckPathPrefix, healthCheckLivenessPath),
+		}
+
+		req, err := http.NewRequest(http.MethodGet, serverURL.String(), nil)
+		if err != nil {
+			continue
+		}
+
+		proxyRequests[&http.Client{
+			Transport: proxyEp.Transport,
+		}] = reqIndex{
+			Request: req,
+			Idx:     i,
+		}
+	}
+
+	for c, r := range proxyRequests {
+		if err := httpDo(c, r.Request, func(resp *http.Response, err error) error {
+			if err != nil {
+				return err
+			}
+			xhttp.DrainBody(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				return errors.New(resp.Status)
+			}
+			if v := resp.Header.Get(xhttp.MinIOServerStatus); v == unavailable {
+				return errors.New(v)
+			}
+			return nil
+		}); err != nil {
+			continue
+		}
+		return r.Idx
 	}
 	return -1
 }

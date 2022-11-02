@@ -1,73 +1,41 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
-	"math"
 	"net/http"
-	"path"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/dustin/go-humanize"
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio-go/v7"
+	minio "github.com/minio/minio-go/v7"
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	"github.com/minio/minio/internal/bucket/bandwidth"
-	"github.com/minio/minio/internal/bucket/replication"
-	"github.com/minio/minio/internal/config/storageclass"
-	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/minio/internal/event"
-	"github.com/minio/minio/internal/hash"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-)
-
-const (
-	throttleDeadline = 1 * time.Hour
-	// ReplicationReset has reset id and timestamp of last reset operation
-	ReplicationReset = "replication-reset"
-	// ReplicationStatus has internal replication status - stringified representation of target's replication status for all replication
-	// activity initiated from this cluster
-	ReplicationStatus = "replication-status"
-	// ReplicationTimestamp - the last time replication was initiated on this cluster for this object version
-	ReplicationTimestamp = "replication-timestamp"
-	// ReplicaStatus - this header is present if a replica was received by this cluster for this object version
-	ReplicaStatus = "replica-status"
-	// ReplicaTimestamp - the last time a replica was received by this cluster for this object version
-	ReplicaTimestamp = "replica-timestamp"
-	// TaggingTimestamp - the last time a tag metadata modification happened on this cluster for this object version
-	TaggingTimestamp = "tagging-timestamp"
-	// ObjectLockRetentionTimestamp - the last time a object lock metadata modification happened on this cluster for this object version
-	ObjectLockRetentionTimestamp = "objectlock-retention-timestamp"
-	// ObjectLockLegalHoldTimestamp - the last time a legal hold metadata modification happened on this cluster for this object version
-	ObjectLockLegalHoldTimestamp = "objectlock-legalhold-timestamp"
-	// ReplicationWorkerMultiplier is suggested worker multiplier if traffic exceeds replication worker capacity
-	ReplicationWorkerMultiplier = 1.5
+	"github.com/minio/minio/cmd/crypto"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/bucket/bandwidth"
+	"github.com/minio/minio/pkg/bucket/replication"
+	"github.com/minio/minio/pkg/event"
+	iampolicy "github.com/minio/minio/pkg/iam/policy"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 // gets replication config associated to a given bucket name.
@@ -75,10 +43,10 @@ func getReplicationConfig(ctx context.Context, bucketName string) (rc *replicati
 	if globalIsGateway {
 		objAPI := newObjectLayerFn()
 		if objAPI == nil {
-			return rc, errServerNotInitialized
+			return nil, errServerNotInitialized
 		}
 
-		return rc, BucketReplicationConfigNotFound{Bucket: bucketName}
+		return nil, BucketReplicationConfigNotFound{Bucket: bucketName}
 	}
 
 	return globalBucketMetadataSys.GetReplicationConfig(ctx, bucketName)
@@ -86,135 +54,87 @@ func getReplicationConfig(ctx context.Context, bucketName string) (rc *replicati
 
 // validateReplicationDestination returns error if replication destination bucket missing or not configured
 // It also returns true if replication destination is same as this server.
-func validateReplicationDestination(ctx context.Context, bucket string, rCfg *replication.Config) (bool, APIError) {
-	var arns []string
-	if rCfg.RoleArn != "" {
-		arns = append(arns, rCfg.RoleArn)
-	} else {
-		for _, rule := range rCfg.Rules {
-			arns = append(arns, rule.Destination.String())
-		}
+func validateReplicationDestination(ctx context.Context, bucket string, rCfg *replication.Config) (bool, error) {
+	arn, err := madmin.ParseARN(rCfg.RoleArn)
+	if err != nil {
+		return false, BucketRemoteArnInvalid{}
 	}
-	for _, arnStr := range arns {
-		arn, err := madmin.ParseARN(arnStr)
-		if err != nil {
-			return false, errorCodes.ToAPIErrWithErr(ErrBucketRemoteArnInvalid, err)
-		}
-		if arn.Type != madmin.ReplicationService {
-			return false, toAPIError(ctx, BucketRemoteArnTypeInvalid{Bucket: bucket})
-		}
-		clnt := globalBucketTargetSys.GetRemoteTargetClient(ctx, arnStr)
-		if clnt == nil {
-			return false, toAPIError(ctx, BucketRemoteTargetNotFound{Bucket: bucket})
-		}
-		if found, err := clnt.BucketExists(ctx, arn.Bucket); !found {
-			return false, errorCodes.ToAPIErrWithErr(ErrRemoteDestinationNotFoundError, err)
-		}
-		if ret, err := globalBucketObjectLockSys.Get(bucket); err == nil {
-			if ret.LockEnabled {
-				lock, _, _, _, err := clnt.GetObjectLockConfig(ctx, arn.Bucket)
-				if err != nil || lock != "Enabled" {
-					return false, errorCodes.ToAPIErrWithErr(ErrReplicationDestinationMissingLock, err)
-				}
-			}
-		}
-		// validate replication ARN against target endpoint
-		c, ok := globalBucketTargetSys.arnRemotesMap[arnStr]
-		if ok {
-			if c.EndpointURL().String() == clnt.EndpointURL().String() {
-				sameTarget, _ := isLocalHost(clnt.EndpointURL().Hostname(), clnt.EndpointURL().Port(), globalMinioPort)
-				return sameTarget, toAPIError(ctx, nil)
+	if arn.Type != madmin.ReplicationService {
+		return false, BucketRemoteArnTypeInvalid{}
+	}
+	clnt := globalBucketTargetSys.GetRemoteTargetClient(ctx, rCfg.RoleArn)
+	if clnt == nil {
+		return false, BucketRemoteTargetNotFound{Bucket: bucket}
+	}
+	if found, _ := clnt.BucketExists(ctx, rCfg.GetDestination().Bucket); !found {
+		return false, BucketRemoteDestinationNotFound{Bucket: rCfg.GetDestination().Bucket}
+	}
+	if ret, err := globalBucketObjectLockSys.Get(bucket); err == nil {
+		if ret.LockEnabled {
+			lock, _, _, _, err := clnt.GetObjectLockConfig(ctx, rCfg.GetDestination().Bucket)
+			if err != nil || lock != "Enabled" {
+				return false, BucketReplicationDestinationMissingLock{Bucket: rCfg.GetDestination().Bucket}
 			}
 		}
 	}
-	return false, toAPIError(ctx, BucketRemoteTargetNotFound{Bucket: bucket})
-}
-
-type mustReplicateOptions struct {
-	meta               map[string]string
-	status             replication.StatusType
-	opType             replication.Type
-	replicationRequest bool // incoming request is a replication request
-}
-
-func (o mustReplicateOptions) ReplicationStatus() (s replication.StatusType) {
-	if rs, ok := o.meta[xhttp.AmzBucketReplicationStatus]; ok {
-		return replication.StatusType(rs)
-	}
-	return s
-}
-
-func (o mustReplicateOptions) isExistingObjectReplication() bool {
-	return o.opType == replication.ExistingObjectReplicationType
-}
-
-func (o mustReplicateOptions) isMetadataReplication() bool {
-	return o.opType == replication.MetadataReplicationType
-}
-
-func getMustReplicateOptions(o ObjectInfo, op replication.Type, opts ObjectOptions) mustReplicateOptions {
-	if !op.Valid() {
-		op = replication.ObjectReplicationType
-		if o.metadataOnly {
-			op = replication.MetadataReplicationType
+	// validate replication ARN against target endpoint
+	c, ok := globalBucketTargetSys.arnRemotesMap[rCfg.RoleArn]
+	if ok {
+		if c.EndpointURL().String() == clnt.EndpointURL().String() {
+			sameTarget, _ := isLocalHost(clnt.EndpointURL().Hostname(), clnt.EndpointURL().Port(), globalMinioPort)
+			return sameTarget, nil
 		}
 	}
-	meta := cloneMSS(o.UserDefined)
-	if o.UserTags != "" {
-		meta[xhttp.AmzObjectTagging] = o.UserTags
-	}
+	return false, BucketRemoteTargetNotFound{Bucket: bucket}
+}
 
-	return mustReplicateOptions{
-		meta:               meta,
-		status:             o.ReplicationStatus,
-		opType:             op,
-		replicationRequest: opts.ReplicationRequest,
+func mustReplicateWeb(ctx context.Context, r *http.Request, bucket, object string, meta map[string]string, replStatus string, permErr APIErrorCode) (replicate bool, sync bool) {
+	if permErr != ErrNone {
+		return
 	}
+	return mustReplicater(ctx, bucket, object, meta, replStatus)
 }
 
 // mustReplicate returns 2 booleans - true if object meets replication criteria and true if replication is to be done in
 // a synchronous manner.
-func mustReplicate(ctx context.Context, bucket, object string, mopts mustReplicateOptions) (dsc ReplicateDecision) {
+func mustReplicate(ctx context.Context, r *http.Request, bucket, object string, meta map[string]string, replStatus string) (replicate bool, sync bool) {
+	if s3Err := isPutActionAllowed(ctx, getRequestAuthType(r), bucket, "", r, iampolicy.GetReplicationConfigurationAction); s3Err != ErrNone {
+		return
+	}
+	return mustReplicater(ctx, bucket, object, meta, replStatus)
+}
+
+// mustReplicater returns 2 booleans - true if object meets replication criteria and true if replication is to be done in
+// a synchronous manner.
+func mustReplicater(ctx context.Context, bucket, object string, meta map[string]string, replStatus string) (replicate bool, sync bool) {
 	if globalIsGateway {
-		return
+		return replicate, sync
 	}
-
-	replStatus := mopts.ReplicationStatus()
-	if replStatus == replication.Replica && !mopts.isMetadataReplication() {
-		return
+	if rs, ok := meta[xhttp.AmzBucketReplicationStatus]; ok {
+		replStatus = rs
 	}
-
-	if mopts.replicationRequest { // incoming replication request on target cluster
-		return
+	if replication.StatusType(replStatus) == replication.Replica {
+		return replicate, sync
 	}
 	cfg, err := getReplicationConfig(ctx, bucket)
 	if err != nil {
-		return
+		return replicate, sync
 	}
 	opts := replication.ObjectOpts{
-		Name:           object,
-		SSEC:           crypto.SSEC.IsEncrypted(mopts.meta),
-		Replica:        replStatus == replication.Replica,
-		ExistingObject: mopts.isExistingObjectReplication(),
+		Name: object,
+		SSEC: crypto.SSEC.IsEncrypted(meta),
 	}
-	tagStr, ok := mopts.meta[xhttp.AmzObjectTagging]
+	tagStr, ok := meta[xhttp.AmzObjectTagging]
 	if ok {
 		opts.UserTags = tagStr
 	}
-	tgtArns := cfg.FilterTargetArns(opts)
-	for _, tgtArn := range tgtArns {
-		tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, tgtArn)
-		// the target online status should not be used here while deciding
-		// whether to replicate as the target could be temporarily down
-		opts.TargetArn = tgtArn
-		replicate := cfg.Replicate(opts)
-		var synchronous bool
-		if tgt != nil {
-			synchronous = tgt.replicateSync
-		}
-		dsc.Set(newReplicateTargetDecision(tgtArn, replicate, synchronous))
+	tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, cfg.RoleArn)
+	// the target online status should not be used here while deciding
+	// whether to replicate as the target could be temporarily down
+	if tgt != nil {
+		return cfg.Replicate(opts), tgt.replicateSync
 	}
-	return dsc
+	return cfg.Replicate(opts), false
 }
 
 // Standard headers that needs to be extracted from User metadata.
@@ -254,14 +174,35 @@ func isStandardHeader(matchHeaderKey string) bool {
 }
 
 // returns whether object version is a deletemarker and if object qualifies for replication
-func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelete, oi ObjectInfo, delOpts ObjectOptions, gerr error) (dsc ReplicateDecision) {
+func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelete, oi ObjectInfo, gerr error) (dm, replicate, sync bool) {
 	rcfg, err := getReplicationConfig(ctx, bucket)
 	if err != nil || rcfg == nil {
-		return
+		return false, false, sync
 	}
-	// If incoming request is a replication request, it does not need to be re-replicated.
-	if delOpts.ReplicationRequest {
-		return
+	// when incoming delete is removal of a delete marker( a.k.a versioned delete),
+	// GetObjectInfo returns extra information even though it returns errFileNotFound
+	if gerr != nil {
+		validReplStatus := false
+		switch oi.ReplicationStatus {
+		// Point to note: even if two way replication with Deletemarker or Delete sync is enabled,
+		// deletion of a REPLICA object/deletemarker will not trigger a replication to the other cluster.
+		case replication.Pending, replication.Completed, replication.Failed:
+			validReplStatus = true
+		}
+		if oi.DeleteMarker && validReplStatus {
+			return oi.DeleteMarker, true, sync
+		}
+		return oi.DeleteMarker, false, sync
+	}
+	if oi.ReplicationStatus == replication.Replica {
+		// avoid replicating a replica in bi-directional replication
+		return oi.DeleteMarker, false, sync
+	}
+	tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, rcfg.RoleArn)
+	// the target online status should not be used here while deciding
+	// whether to replicate deletes as the target could be temporarily down
+	if tgt == nil {
+		return oi.DeleteMarker, false, false
 	}
 	opts := replication.ObjectOpts{
 		Name:         dobj.ObjectName,
@@ -269,45 +210,8 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 		UserTags:     oi.UserTags,
 		DeleteMarker: oi.DeleteMarker,
 		VersionID:    dobj.VersionID,
-		OpType:       replication.DeleteReplicationType,
 	}
-	tgtArns := rcfg.FilterTargetArns(opts)
-	if len(tgtArns) > 0 {
-		dsc.targetsMap = make(map[string]replicateTargetDecision, len(tgtArns))
-		var sync, replicate bool
-		for _, tgtArn := range tgtArns {
-			opts.TargetArn = tgtArn
-			replicate = rcfg.Replicate(opts)
-			// when incoming delete is removal of a delete marker( a.k.a versioned delete),
-			// GetObjectInfo returns extra information even though it returns errFileNotFound
-			if gerr != nil {
-				validReplStatus := false
-				switch oi.TargetReplicationStatus(tgtArn) {
-				case replication.Pending, replication.Completed, replication.Failed:
-					validReplStatus = true
-				}
-				if oi.DeleteMarker && (validReplStatus || replicate) {
-					dsc.Set(newReplicateTargetDecision(tgtArn, replicate, sync))
-					continue
-				} else {
-					// can be the case that other cluster is down and duplicate `mc rm --vid`
-					// is issued - this still needs to be replicated back to the other target
-					replicate = oi.VersionPurgeStatus == Pending || oi.VersionPurgeStatus == Failed
-					dsc.Set(newReplicateTargetDecision(tgtArn, replicate, sync))
-					continue
-				}
-			}
-			tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, tgtArn)
-			// the target online status should not be used here while deciding
-			// whether to replicate deletes as the target could be temporarily down
-			tgtDsc := newReplicateTargetDecision(tgtArn, false, false)
-			if tgt != nil {
-				tgtDsc = newReplicateTargetDecision(tgtArn, replicate, tgt.replicateSync)
-			}
-			dsc.Set(tgtDsc)
-		}
-	}
-	return dsc
+	return oi.DeleteMarker, rcfg.Replicate(opts), tgt.replicateSync
 }
 
 // replicate deletes to the designated replication target if replication configuration
@@ -320,23 +224,12 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 // target cluster, the object version is marked deleted on the source and hidden from listing. It is permanently
 // deleted from the source when the VersionPurgeStatus changes to "Complete", i.e after replication succeeds
 // on target.
-func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, objectAPI ObjectLayer, trigger string) {
-	var replicationStatus replication.StatusType
+func replicateDelete(ctx context.Context, dobj DeletedObjectVersionInfo, objectAPI ObjectLayer) {
 	bucket := dobj.Bucket
 	versionID := dobj.DeleteMarkerVersionID
 	if versionID == "" {
 		versionID = dobj.VersionID
 	}
-
-	defer func() {
-		replStatus := string(replicationStatus)
-		auditLogInternal(context.Background(), bucket, dobj.ObjectName, AuditLogOptions{
-			Trigger:   trigger,
-			APIName:   ReplicateDeleteAPI,
-			VersionID: versionID,
-			Status:    replStatus,
-		})
-	}()
 
 	rcfg, err := getReplicationConfig(ctx, bucket)
 	if err != nil || rcfg == nil {
@@ -354,9 +247,10 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 		})
 		return
 	}
-	dsc, err := parseReplicateDecision(dobj.ReplicationState.ReplicateDecisionStr)
-	if err != nil {
-		logger.LogIf(ctx, err)
+
+	tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, rcfg.RoleArn)
+	if tgt == nil {
+		logger.LogIf(ctx, fmt.Errorf("failed to get target for bucket:%s arn:%s", bucket, rcfg.RoleArn))
 		sendEvent(eventArgs{
 			BucketName: bucket,
 			Object: ObjectInfo{
@@ -371,93 +265,45 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 		return
 	}
 
-	// Lock the object name before starting replication operation.
-	// Use separate lock that doesn't collide with regular objects.
-	lk := objectAPI.NewNSLock(bucket, "/[replicate]/"+dobj.ObjectName)
-	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("failed to get lock for object: %s bucket:%s arn:%s", dobj.ObjectName, bucket, rcfg.RoleArn))
-		sendEvent(eventArgs{
-			BucketName: bucket,
-			Object: ObjectInfo{
-				Bucket:       bucket,
-				Name:         dobj.ObjectName,
-				VersionID:    versionID,
-				DeleteMarker: dobj.DeleteMarker,
-			},
-			Host:      "Internal: [Replication]",
-			EventName: event.ObjectReplicationNotTracked,
-		})
-		return
-	}
-	ctx = lkctx.Context()
-	defer lk.Unlock(lkctx.Cancel)
+	rmErr := tgt.RemoveObject(ctx, rcfg.GetDestination().Bucket, dobj.ObjectName, miniogo.RemoveObjectOptions{
+		VersionID: versionID,
+		Internal: miniogo.AdvancedRemoveOptions{
+			ReplicationDeleteMarker: dobj.DeleteMarkerVersionID != "",
+			ReplicationMTime:        dobj.DeleteMarkerMTime.Time,
+			ReplicationStatus:       miniogo.ReplicationStatusReplica,
+		},
+	})
 
-	var wg sync.WaitGroup
-	var rinfos replicatedInfos
-	rinfos.Targets = make([]replicatedTargetInfo, len(dsc.targetsMap))
-	idx := -1
-	for tgtArn := range dsc.targetsMap {
-		idx++
-		tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, tgtArn)
-		if tgt == nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to get target for bucket:%s arn:%s", bucket, tgtArn))
-			sendEvent(eventArgs{
-				BucketName: bucket,
-				Object: ObjectInfo{
-					Bucket:       bucket,
-					Name:         dobj.ObjectName,
-					VersionID:    versionID,
-					DeleteMarker: dobj.DeleteMarker,
-				},
-				Host:      "Internal: [Replication]",
-				EventName: event.ObjectReplicationNotTracked,
-			})
-			continue
+	replicationStatus := dobj.DeleteMarkerReplicationStatus
+	versionPurgeStatus := dobj.VersionPurgeStatus
+
+	if rmErr != nil {
+		if dobj.VersionID == "" {
+			replicationStatus = string(replication.Failed)
+		} else {
+			versionPurgeStatus = Failed
 		}
-		if tgt := dsc.targetsMap[tgtArn]; !tgt.Replicate {
-			continue
-		}
-		// if dobj.TargetArn is not empty string, this is a case of specific target being re-synced.
-		if dobj.TargetArn != "" && dobj.TargetArn != tgt.ARN {
-			continue
-		}
-		wg.Add(1)
-		go func(index int, tgt *TargetClient) {
-			defer wg.Done()
-			rinfo := replicateDeleteToTarget(ctx, dobj, tgt)
-			rinfos.Targets[index] = rinfo
-		}(idx, tgt)
-	}
-	wg.Wait()
-
-	replicationStatus = rinfos.ReplicationStatus()
-	prevStatus := dobj.DeleteMarkerReplicationStatus()
-
-	if dobj.VersionID != "" {
-		prevStatus = replication.StatusType(dobj.VersionPurgeStatus())
-		replicationStatus = replication.StatusType(rinfos.VersionPurgeStatus())
-	}
-
-	// to decrement pending count later.
-	for _, rinfo := range rinfos.Targets {
-		if rinfo.ReplicationStatus != rinfo.PrevReplicationStatus {
-			globalReplicationStats.Update(dobj.Bucket, rinfo.Arn, 0, 0, replicationStatus,
-				prevStatus, replication.DeleteReplicationType)
+		logger.LogIf(ctx, fmt.Errorf("Unable to replicate delete marker to %s/%s(%s): %s", rcfg.GetDestination().Bucket, dobj.ObjectName, versionID, rmErr))
+	} else {
+		if dobj.VersionID == "" {
+			replicationStatus = string(replication.Completed)
+		} else {
+			versionPurgeStatus = Complete
 		}
 	}
 
-	eventName := event.ObjectReplicationComplete
-	if replicationStatus == replication.Failed {
+	var eventName = event.ObjectReplicationComplete
+	if replicationStatus == string(replication.Failed) || versionPurgeStatus == Failed {
 		eventName = event.ObjectReplicationFailed
 	}
-	drs := getReplicationState(rinfos, dobj.ReplicationState, dobj.VersionID)
+
+	// Update metadata on the delete marker or purge permanent delete if replication success.
 	dobjInfo, err := objectAPI.DeleteObject(ctx, bucket, dobj.ObjectName, ObjectOptions{
-		VersionID:         versionID,
-		MTime:             dobj.DeleteMarkerMTime.Time,
-		DeleteReplication: drs,
-		Versioned:         globalBucketVersioningSys.Enabled(bucket),
-		VersionSuspended:  globalBucketVersioningSys.Suspended(bucket),
+		VersionID:                     versionID,
+		DeleteMarkerReplicationStatus: replicationStatus,
+		VersionPurgeStatus:            versionPurgeStatus,
+		Versioned:                     globalBucketVersioningSys.Enabled(bucket),
+		VersionSuspended:              globalBucketVersioningSys.Suspended(bucket),
 	})
 	if err != nil && !isErrVersionNotFound(err) { // VersionNotFound would be reported by pool that object version is missing on.
 		logger.LogIf(ctx, fmt.Errorf("Unable to update replication metadata for %s/%s(%s): %s", bucket, dobj.ObjectName, versionID, err))
@@ -482,89 +328,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 	}
 }
 
-func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationInfo, tgt *TargetClient) (rinfo replicatedTargetInfo) {
-	versionID := dobj.DeleteMarkerVersionID
-	if versionID == "" {
-		versionID = dobj.VersionID
-	}
-
-	rinfo = dobj.ReplicationState.targetState(tgt.ARN)
-	rinfo.OpType = dobj.OpType
-	defer func() {
-		if rinfo.ReplicationStatus == replication.Completed && tgt.ResetID != "" && dobj.OpType == replication.ExistingObjectReplicationType {
-			rinfo.ResyncTimestamp = fmt.Sprintf("%s;%s", UTCNow().Format(http.TimeFormat), tgt.ResetID)
-		}
-	}()
-
-	if dobj.VersionID == "" && rinfo.PrevReplicationStatus == replication.Completed && dobj.OpType != replication.ExistingObjectReplicationType {
-		rinfo.ReplicationStatus = rinfo.PrevReplicationStatus
-		return
-	}
-	if dobj.VersionID != "" && rinfo.VersionPurgeStatus == Complete {
-		return
-	}
-	if tgt.IsOffline() {
-		logger.LogIf(ctx, fmt.Errorf("remote target is offline for bucket:%s arn:%s", dobj.Bucket, tgt.ARN))
-		sendEvent(eventArgs{
-			BucketName: dobj.Bucket,
-			Object: ObjectInfo{
-				Bucket:       dobj.Bucket,
-				Name:         dobj.ObjectName,
-				VersionID:    dobj.VersionID,
-				DeleteMarker: dobj.DeleteMarker,
-			},
-			Host:      "Internal: [Replication]",
-			EventName: event.ObjectReplicationNotTracked,
-		})
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Failed
-		} else {
-			rinfo.VersionPurgeStatus = Failed
-		}
-		return
-	}
-	// early return if already replicated delete marker for existing object replication/ healing delete markers
-	if dobj.DeleteMarkerVersionID != "" && (dobj.OpType == replication.ExistingObjectReplicationType || dobj.OpType == replication.HealReplicationType) {
-		if _, err := tgt.StatObject(ctx, tgt.Bucket, dobj.ObjectName, miniogo.StatObjectOptions{
-			VersionID: versionID,
-			Internal: miniogo.AdvancedGetOptions{
-				ReplicationProxyRequest: "false",
-			},
-		}); isErrMethodNotAllowed(ErrorRespToObjectError(err, dobj.Bucket, dobj.ObjectName)) {
-			if dobj.VersionID == "" {
-				rinfo.ReplicationStatus = replication.Completed
-				return
-			}
-		}
-	}
-
-	rmErr := tgt.RemoveObject(ctx, tgt.Bucket, dobj.ObjectName, miniogo.RemoveObjectOptions{
-		VersionID: versionID,
-		Internal: miniogo.AdvancedRemoveOptions{
-			ReplicationDeleteMarker: dobj.DeleteMarkerVersionID != "",
-			ReplicationMTime:        dobj.DeleteMarkerMTime.Time,
-			ReplicationStatus:       miniogo.ReplicationStatusReplica,
-			ReplicationRequest:      true, // always set this to distinguish between `mc mirror` replication and serverside
-		},
-	})
-	if rmErr != nil {
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Failed
-		} else {
-			rinfo.VersionPurgeStatus = Failed
-		}
-		logger.LogIf(ctx, fmt.Errorf("Unable to replicate delete marker to %s/%s(%s): %s", tgt.Bucket, dobj.ObjectName, versionID, rmErr))
-	} else {
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Completed
-		} else {
-			rinfo.VersionPurgeStatus = Complete
-		}
-	}
-	return
-}
-
-func getCopyObjMetadata(oi ObjectInfo, sc string) map[string]string {
+func getCopyObjMetadata(oi ObjectInfo, dest replication.Destination) map[string]string {
 	meta := make(map[string]string, len(oi.UserDefined))
 	for k, v := range oi.UserDefined {
 		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
@@ -579,6 +343,7 @@ func getCopyObjMetadata(oi ObjectInfo, sc string) map[string]string {
 		if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
 			continue
 		}
+
 		meta[k] = v
 	}
 
@@ -595,14 +360,13 @@ func getCopyObjMetadata(oi ObjectInfo, sc string) map[string]string {
 		meta[xhttp.AmzTagDirective] = "REPLACE"
 	}
 
+	sc := dest.StorageClass
 	if sc == "" {
 		sc = oi.StorageClass
 	}
-	// drop non standard storage classes for tiering from replication
-	if sc != "" && (sc == storageclass.RRS || sc == storageclass.STANDARD) {
+	if sc != "" {
 		meta[xhttp.AmzStorageClass] = sc
 	}
-
 	meta[xhttp.MinIOSourceETag] = oi.ETag
 	meta[xhttp.MinIOSourceMTime] = oi.ModTime.Format(time.RFC3339Nano)
 	meta[xhttp.AmzBucketReplicationStatus] = replication.Replica.String()
@@ -629,7 +393,7 @@ func (m caseInsensitiveMap) Lookup(key string) (string, bool) {
 	return "", false
 }
 
-func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts miniogo.PutObjectOptions, err error) {
+func putReplicationOpts(ctx context.Context, dest replication.Destination, objInfo ObjectInfo) (putOpts miniogo.PutObjectOptions, err error) {
 	meta := make(map[string]string)
 	for k, v := range objInfo.UserDefined {
 		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
@@ -641,7 +405,8 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 		meta[k] = v
 	}
 
-	if sc == "" && (objInfo.StorageClass == storageclass.STANDARD || objInfo.StorageClass == storageclass.RRS) {
+	sc := dest.StorageClass
+	if sc == "" {
 		sc = objInfo.StorageClass
 	}
 	putOpts = miniogo.PutObjectOptions{
@@ -650,26 +415,16 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 		ContentEncoding: objInfo.ContentEncoding,
 		StorageClass:    sc,
 		Internal: miniogo.AdvancedPutOptions{
-			SourceVersionID:    objInfo.VersionID,
-			ReplicationStatus:  miniogo.ReplicationStatusReplica,
-			SourceMTime:        objInfo.ModTime,
-			SourceETag:         objInfo.ETag,
-			ReplicationRequest: true, // always set this to distinguish between `mc mirror` replication and serverside
+			SourceVersionID:   objInfo.VersionID,
+			ReplicationStatus: miniogo.ReplicationStatusReplica,
+			SourceMTime:       objInfo.ModTime,
+			SourceETag:        objInfo.ETag,
 		},
 	}
 	if objInfo.UserTags != "" {
 		tag, _ := tags.ParseObjectTags(objInfo.UserTags)
 		if tag != nil {
 			putOpts.UserTags = tag.ToMap()
-			// set tag timestamp in opts
-			tagTimestamp := objInfo.ModTime
-			if tagTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; ok {
-				tagTimestamp, err = time.Parse(time.RFC3339Nano, tagTmstampStr)
-				if err != nil {
-					return putOpts, err
-				}
-			}
-			putOpts.Internal.TaggingTimestamp = tagTimestamp
 		}
 	}
 
@@ -693,27 +448,9 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 			return putOpts, err
 		}
 		putOpts.RetainUntilDate = rdate
-		// set retention timestamp in opts
-		retTimestamp := objInfo.ModTime
-		if retainTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]; ok {
-			retTimestamp, err = time.Parse(time.RFC3339Nano, retainTmstampStr)
-			if err != nil {
-				return putOpts, err
-			}
-		}
-		putOpts.Internal.RetentionTimestamp = retTimestamp
 	}
 	if lhold, ok := lkMap.Lookup(xhttp.AmzObjectLockLegalHold); ok {
 		putOpts.LegalHold = miniogo.LegalHoldStatus(lhold)
-		// set legalhold timestamp in opts
-		lholdTimestamp := objInfo.ModTime
-		if lholdTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp]; ok {
-			lholdTimestamp, err = time.Parse(time.RFC3339Nano, lholdTmstampStr)
-			if err != nil {
-				return putOpts, err
-			}
-		}
-		putOpts.Internal.LegalholdTimestamp = lholdTimestamp
 	}
 	if crypto.S3.IsEncrypted(objInfo.UserDefined) {
 		putOpts.ServerSideEncryption = encrypt.NewSSE()
@@ -732,7 +469,7 @@ const (
 // matches k1 with all keys, returns 'true' if one of them matches
 func equals(k1 string, keys ...string) bool {
 	for _, k2 := range keys {
-		if strings.EqualFold(k1, k2) {
+		if strings.ToLower(k1) == strings.ToLower(k2) {
 			return true
 		}
 	}
@@ -740,12 +477,7 @@ func equals(k1 string, keys ...string) bool {
 }
 
 // returns replicationAction by comparing metadata between source and target
-func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replication.Type) replicationAction {
-	// Avoid resyncing null versions created prior to enabling replication if target has a newer copy
-	if opType == replication.ExistingObjectReplicationType &&
-		oi1.ModTime.Unix() > oi2.LastModified.Unix() && oi1.VersionID == nullVersionID {
-		return replicateNone
-	}
+func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo) replicationAction {
 	// needs full replication
 	if oi1.ETag != oi2.ETag ||
 		oi1.VersionID != oi2.VersionID ||
@@ -773,7 +505,7 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 	}
 
 	t, _ := tags.ParseObjectTags(oi1.UserTags)
-	if !reflect.DeepEqual(oi2.UserTags, t.ToMap()) || (oi2.UserTagCount != len(t.ToMap())) {
+	if !reflect.DeepEqual(oi2.UserTags, t.ToMap()) {
 		return replicateMetadata
 	}
 
@@ -830,25 +562,12 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 
 // replicateObject replicates the specified version of the object to destination bucket
 // The source object is then updated to reflect the replication status.
-func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI ObjectLayer, trigger string) {
-	var replicationStatus replication.StatusType
-	defer func() {
-		if replicationStatus.Empty() {
-			// replication status is empty means
-			// replication was not attempted for some
-			// reason, notify the state of the object
-			// on disk.
-			replicationStatus = ri.ReplicationStatus
-		}
-		auditLogInternal(ctx, ri.Bucket, ri.Name, AuditLogOptions{
-			Trigger:   trigger,
-			APIName:   ReplicateObjectAPI,
-			VersionID: ri.VersionID,
-			Status:    replicationStatus.String(),
-		})
-	}()
+func replicateObject(ctx context.Context, objInfo ObjectInfo, objectAPI ObjectLayer) {
+	z, ok := objectAPI.(*erasureServerPools)
+	if !ok {
+		return
+	}
 
-	objInfo := ri.ObjectInfo
 	bucket := objInfo.Bucket
 	object := objInfo.Name
 
@@ -863,152 +582,9 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 		})
 		return
 	}
-	tgtArns := cfg.FilterTargetArns(replication.ObjectOpts{
-		Name:     object,
-		SSEC:     crypto.SSEC.IsEncrypted(objInfo.UserDefined),
-		UserTags: objInfo.UserTags,
-	})
-	// Lock the object name before starting replication.
-	// Use separate lock that doesn't collide with regular objects.
-	lk := objectAPI.NewNSLock(bucket, "/[replicate]/"+object)
-	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		sendEvent(eventArgs{
-			EventName:  event.ObjectReplicationNotTracked,
-			BucketName: bucket,
-			Object:     objInfo,
-			Host:       "Internal: [Replication]",
-		})
-		logger.LogIf(ctx, fmt.Errorf("failed to get lock for object: %s bucket:%s arn:%s", object, bucket, cfg.RoleArn))
-		return
-	}
-	ctx = lkctx.Context()
-	defer lk.Unlock(lkctx.Cancel)
-
-	var wg sync.WaitGroup
-	var rinfos replicatedInfos
-	rinfos.Targets = make([]replicatedTargetInfo, len(tgtArns))
-	for i, tgtArn := range tgtArns {
-		tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, tgtArn)
-		if tgt == nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to get target for bucket:%s arn:%s", bucket, tgtArn))
-			sendEvent(eventArgs{
-				EventName:  event.ObjectReplicationNotTracked,
-				BucketName: bucket,
-				Object:     objInfo,
-				Host:       "Internal: [Replication]",
-			})
-			continue
-		}
-		wg.Add(1)
-		go func(index int, tgt *TargetClient) {
-			defer wg.Done()
-			rinfos.Targets[index] = replicateObjectToTarget(ctx, ri, objectAPI, tgt)
-		}(i, tgt)
-	}
-	wg.Wait()
-	// FIXME: add support for missing replication events
-	// - event.ObjectReplicationMissedThreshold
-	// - event.ObjectReplicationReplicatedAfterThreshold
-	eventName := event.ObjectReplicationComplete
-	if rinfos.ReplicationStatus() == replication.Failed {
-		eventName = event.ObjectReplicationFailed
-	}
-	newReplStatusInternal := rinfos.ReplicationStatusInternal()
-	// Note that internal replication status(es) may match for previously replicated objects - in such cases
-	// metadata should be updated with last resync timestamp.
-	if objInfo.ReplicationStatusInternal != newReplStatusInternal || rinfos.ReplicationResynced() {
-		popts := ObjectOptions{
-			MTime:     objInfo.ModTime,
-			VersionID: objInfo.VersionID,
-			EvalMetadataFn: func(oi ObjectInfo) error {
-				oi.UserDefined[ReservedMetadataPrefixLower+ReplicationStatus] = newReplStatusInternal
-				oi.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)
-				oi.UserDefined[xhttp.AmzBucketReplicationStatus] = string(rinfos.ReplicationStatus())
-				for _, rinfo := range rinfos.Targets {
-					if rinfo.ResyncTimestamp != "" {
-						oi.UserDefined[targetResetHeader(rinfo.Arn)] = rinfo.ResyncTimestamp
-					}
-				}
-				if objInfo.UserTags != "" {
-					oi.UserDefined[xhttp.AmzObjectTagging] = objInfo.UserTags
-				}
-				return nil
-			},
-		}
-
-		if _, err = objectAPI.PutObjectMetadata(ctx, bucket, object, popts); err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to update replication metadata for %s/%s(%s): %w",
-				bucket, objInfo.Name, objInfo.VersionID, err))
-		}
-		opType := replication.MetadataReplicationType
-		if rinfos.Action() == replicateAll {
-			opType = replication.ObjectReplicationType
-		}
-		for _, rinfo := range rinfos.Targets {
-			if rinfo.ReplicationStatus != rinfo.PrevReplicationStatus {
-				globalReplicationStats.Update(bucket, rinfo.Arn, rinfo.Size, rinfo.Duration, rinfo.ReplicationStatus, rinfo.PrevReplicationStatus, opType)
-			}
-		}
-	}
-
-	sendEvent(eventArgs{
-		EventName:  eventName,
-		BucketName: bucket,
-		Object:     objInfo,
-		Host:       "Internal: [Replication]",
-	})
-
-	// re-queue failures once more - keep a retry count to avoid flooding the queue if
-	// the target site is down. Leave it to scanner to catch up instead.
-	if rinfos.ReplicationStatus() != replication.Completed && ri.RetryCount < 1 {
-		ri.OpType = replication.HealReplicationType
-		ri.ReplicationStatusInternal = rinfos.ReplicationStatusInternal()
-		ri.RetryCount++
-		globalReplicationPool.queueReplicaFailedTask(ri)
-	}
-}
-
-// replicateObjectToTarget replicates the specified version of the object to destination bucket
-// The source object is then updated to reflect the replication status.
-func replicateObjectToTarget(ctx context.Context, ri ReplicateObjectInfo, objectAPI ObjectLayer, tgt *TargetClient) (rinfo replicatedTargetInfo) {
-	startTime := time.Now()
-	objInfo := ri.ObjectInfo.Clone()
-	bucket := objInfo.Bucket
-	object := objInfo.Name
-	var (
-		closeOnDefer bool
-		gr           *GetObjectReader
-		size         int64
-		err          error
-	)
-	sz, _ := objInfo.GetActualSize()
-	// set defaults for replication action based on operation being performed - actual
-	// replication action can only be determined after stat on remote. This default is
-	// needed for updating replication metrics correctly when target is offline.
-	var rAction replicationAction
-	switch ri.OpType {
-	case replication.MetadataReplicationType:
-		rAction = replicateMetadata
-	default:
-		rAction = replicateAll
-	}
-	rinfo = replicatedTargetInfo{
-		Size:                  sz,
-		Arn:                   tgt.ARN,
-		PrevReplicationStatus: objInfo.TargetReplicationStatus(tgt.ARN),
-		ReplicationStatus:     replication.Failed,
-		OpType:                ri.OpType,
-		ReplicationAction:     rAction,
-	}
-
-	if ri.ObjectInfo.TargetReplicationStatus(tgt.ARN) == replication.Completed && !ri.ExistingObjResync.Empty() && !ri.ExistingObjResync.mustResyncTarget(tgt.ARN) {
-		rinfo.ReplicationStatus = replication.Completed
-		rinfo.ReplicationResynced = true
-		return
-	}
-	if tgt.IsOffline() {
-		logger.LogIf(ctx, fmt.Errorf("remote target is offline for bucket:%s arn:%s", bucket, tgt.ARN))
+	tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, cfg.RoleArn)
+	if tgt == nil {
+		logger.LogIf(ctx, fmt.Errorf("failed to get target for bucket:%s arn:%s", bucket, cfg.RoleArn))
 		sendEvent(eventArgs{
 			EventName:  event.ObjectReplicationNotTracked,
 			BucketName: bucket,
@@ -1017,8 +593,7 @@ func replicateObjectToTarget(ctx context.Context, ri ReplicateObjectInfo, object
 		})
 		return
 	}
-
-	gr, err = objectAPI.GetObjectNInfo(ctx, bucket, object, nil, http.Header{}, readLock, ObjectOptions{
+	gr, err := objectAPI.GetObjectNInfo(ctx, bucket, object, nil, http.Header{}, readLock, ObjectOptions{
 		VersionID: objInfo.VersionID,
 	})
 	if err != nil {
@@ -1028,18 +603,13 @@ func replicateObjectToTarget(ctx context.Context, ri ReplicateObjectInfo, object
 			Object:     objInfo,
 			Host:       "Internal: [Replication]",
 		})
-		logger.LogIf(ctx, fmt.Errorf("Unable to update replicate for %s/%s(%s): %w", bucket, object, objInfo.VersionID, err))
+		logger.LogIf(ctx, err)
 		return
 	}
-	defer func() {
-		if closeOnDefer {
-			gr.Close()
-		}
-	}()
-	closeOnDefer = true
+	defer gr.Close() // hold read lock for entire transaction
 
 	objInfo = gr.ObjInfo
-	size, err = objInfo.GetActualSize()
+	size, err := objInfo.GetActualSize()
 	if err != nil {
 		logger.LogIf(ctx, err)
 		sendEvent(eventArgs{
@@ -1051,7 +621,8 @@ func replicateObjectToTarget(ctx context.Context, ri ReplicateObjectInfo, object
 		return
 	}
 
-	if tgt.Bucket == "" {
+	dest := cfg.GetDestination()
+	if dest.Bucket == "" {
 		logger.LogIf(ctx, fmt.Errorf("Unable to replicate object %s(%s), bucket is empty", objInfo.Name, objInfo.VersionID))
 		sendEvent(eventArgs{
 			EventName:  event.ObjectReplicationNotTracked,
@@ -1059,80 +630,41 @@ func replicateObjectToTarget(ctx context.Context, ri ReplicateObjectInfo, object
 			Object:     objInfo,
 			Host:       "Internal: [Replication]",
 		})
-		return rinfo
+		return
 	}
-	defer func() {
-		if rinfo.ReplicationStatus == replication.Completed && ri.OpType == replication.ExistingObjectReplicationType && tgt.ResetID != "" {
-			rinfo.ResyncTimestamp = fmt.Sprintf("%s;%s", UTCNow().Format(http.TimeFormat), tgt.ResetID)
-			rinfo.ReplicationResynced = true
-		}
-		rinfo.Duration = time.Since(startTime)
-	}()
 
-	rAction = replicateAll
-	oi, cerr := tgt.StatObject(ctx, tgt.Bucket, object, miniogo.StatObjectOptions{
+	rtype := replicateAll
+	oi, err := tgt.StatObject(ctx, dest.Bucket, object, miniogo.StatObjectOptions{
 		VersionID: objInfo.VersionID,
 		Internal: miniogo.AdvancedGetOptions{
 			ReplicationProxyRequest: "false",
-		},
-	})
-	if cerr == nil {
-		rAction = getReplicationAction(objInfo, oi, ri.OpType)
-		rinfo.ReplicationStatus = replication.Completed
-		if rAction == replicateNone {
-			if ri.OpType == replication.ExistingObjectReplicationType &&
-				objInfo.ModTime.Unix() > oi.LastModified.Unix() && objInfo.VersionID == nullVersionID {
-				logger.LogIf(ctx, fmt.Errorf("Unable to replicate %s/%s (null). Newer version exists on target", bucket, object))
-				sendEvent(eventArgs{
-					EventName:  event.ObjectReplicationNotTracked,
-					BucketName: bucket,
-					Object:     objInfo,
-					Host:       "Internal: [Replication]",
-				})
-			}
+		}})
+	if err == nil {
+		rtype = getReplicationAction(objInfo, oi)
+		if rtype == replicateNone {
 			// object with same VersionID already exists, replication kicked off by
-			// PutObject might have completed
-			if objInfo.TargetReplicationStatus(tgt.ARN) == replication.Pending || objInfo.TargetReplicationStatus(tgt.ARN) == replication.Failed || ri.OpType == replication.ExistingObjectReplicationType {
-				// if metadata is not updated for some reason after replication, such as
-				// 503 encountered while updating metadata - make sure to set ReplicationStatus
-				// as Completed.
-				//
-				// Note: Replication Stats would have been updated despite metadata update failure.
-				gr.Close()
-				closeOnDefer = false
-				rinfo.ReplicationAction = rAction
-				rinfo.ReplicationStatus = replication.Completed
-			}
+			// PutObject might have completed.
 			return
 		}
 	}
-	rinfo.ReplicationStatus = replication.Completed
-	rinfo.Size = size
-	rinfo.ReplicationAction = rAction
-	// use core client to avoid doing multipart on PUT
-	c := &miniogo.Core{Client: tgt.Client}
-	if rAction != replicateAll {
+	replicationStatus := replication.Completed
+	if rtype != replicateAll {
 		// replicate metadata for object tagging/copy with metadata replacement
 		srcOpts := miniogo.CopySrcOptions{
-			Bucket:    tgt.Bucket,
+			Bucket:    dest.Bucket,
 			Object:    object,
-			VersionID: objInfo.VersionID,
-		}
-		dstOpts := miniogo.PutObjectOptions{
-			Internal: miniogo.AdvancedPutOptions{
-				SourceVersionID:    objInfo.VersionID,
-				ReplicationRequest: true, // always set this to distinguish between `mc mirror` replication and serverside
-			},
-		}
-		if _, err = c.CopyObject(ctx, tgt.Bucket, object, tgt.Bucket, object, getCopyObjMetadata(objInfo, tgt.StorageClass), srcOpts, dstOpts); err != nil {
-			rinfo.ReplicationStatus = replication.Failed
+			VersionID: objInfo.VersionID}
+		dstOpts := miniogo.PutObjectOptions{Internal: miniogo.AdvancedPutOptions{SourceVersionID: objInfo.VersionID}}
+		c := &miniogo.Core{Client: tgt.Client}
+
+		if _, err = c.CopyObject(ctx, dest.Bucket, object, dest.Bucket, object, getCopyObjMetadata(objInfo, dest), srcOpts, dstOpts); err != nil {
+			replicationStatus = replication.Failed
 			logger.LogIf(ctx, fmt.Errorf("Unable to replicate metadata for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, err))
 		}
 	} else {
-		var putOpts minio.PutObjectOptions
-		putOpts, err = putReplicationOpts(ctx, tgt.StorageClass, objInfo)
+		target, err := globalBucketMetadataSys.GetBucketTarget(bucket, cfg.RoleArn)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to get target for replication bucket:%s err:%w", bucket, err))
+			logger.LogIf(ctx, fmt.Errorf("failed to get target for replication bucket:%s cfg:%s err:%s", bucket, cfg.RoleArn, err))
 			sendEvent(eventArgs{
 				EventName:  event.ObjectReplicationNotTracked,
 				BucketName: bucket,
@@ -1141,95 +673,70 @@ func replicateObjectToTarget(ctx context.Context, ri ReplicateObjectInfo, object
 			})
 			return
 		}
+
+		putOpts, err := putReplicationOpts(ctx, dest, objInfo)
+		if err != nil {
+			logger.LogIf(ctx, fmt.Errorf("failed to get target for replication bucket:%s cfg:%s err:%w", bucket, cfg.RoleArn, err))
+			sendEvent(eventArgs{
+				EventName:  event.ObjectReplicationNotTracked,
+				BucketName: bucket,
+				Object:     objInfo,
+				Host:       "Internal: [Replication]",
+			})
+			return
+		}
+
+		// Setup bandwidth throttling
+		peers, _ := globalEndpoints.peers()
+		totalNodesCount := len(peers)
+		if totalNodesCount == 0 {
+			totalNodesCount = 1 // For standalone erasure coding
+		}
+		b := target.BandwidthLimit / int64(totalNodesCount)
 		var headerSize int
 		for k, v := range putOpts.Header() {
 			headerSize += len(k) + len(v)
 		}
 
-		opts := &bandwidth.MonitorReaderOptions{
-			Bucket:     objInfo.Bucket,
-			HeaderSize: headerSize,
+		// r takes over closing gr.
+		r := bandwidth.NewMonitoredReader(ctx, globalBucketMonitor, objInfo.Bucket, objInfo.Name, gr, headerSize, b, target.BandwidthLimit)
+		if _, err = tgt.PutObject(ctx, dest.Bucket, object, r, size, putOpts); err != nil {
+			replicationStatus = replication.Failed
+			logger.LogIf(ctx, fmt.Errorf("Unable to replicate for object %s/%s(%s): %w", bucket, objInfo.Name, objInfo.VersionID, err))
 		}
-		newCtx := ctx
-		if globalBucketMonitor.IsThrottled(bucket) {
-			var cancel context.CancelFunc
-			newCtx, cancel = context.WithTimeout(ctx, throttleDeadline)
-			defer cancel()
-		}
-		r := bandwidth.NewMonitoredReader(newCtx, globalBucketMonitor, gr, opts)
-		if objInfo.isMultipart() {
-			if err := replicateObjectWithMultipart(ctx, c, tgt.Bucket, object,
-				r, objInfo, putOpts); err != nil {
-				rinfo.ReplicationStatus = replication.Failed
-				logger.LogIf(ctx, fmt.Errorf("Unable to replicate for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, err))
-			}
-		} else {
-			if _, err = c.PutObject(ctx, tgt.Bucket, object, r, size, "", "", putOpts); err != nil {
-				rinfo.ReplicationStatus = replication.Failed
-				logger.LogIf(ctx, fmt.Errorf("Unable to replicate for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, err))
-			}
-		}
+		defer r.Close()
 	}
-	gr.Close()
-	closeOnDefer = false
-	return
-}
 
-func replicateObjectWithMultipart(ctx context.Context, c *miniogo.Core, bucket, object string, r io.Reader, objInfo ObjectInfo, opts miniogo.PutObjectOptions) (err error) {
-	var uploadedParts []miniogo.CompletePart
-	uploadID, err := c.NewMultipartUpload(context.Background(), bucket, object, opts)
+	objInfo.UserDefined[xhttp.AmzBucketReplicationStatus] = replicationStatus.String()
+	if objInfo.UserTags != "" {
+		objInfo.UserDefined[xhttp.AmzObjectTagging] = objInfo.UserTags
+	}
+
+	// FIXME: add support for missing replication events
+	// - event.ObjectReplicationMissedThreshold
+	// - event.ObjectReplicationReplicatedAfterThreshold
+	var eventName = event.ObjectReplicationComplete
+	if replicationStatus == replication.Failed {
+		eventName = event.ObjectReplicationFailed
+	}
+
+	// This lower level implementation is necessary to avoid write locks from CopyObject.
+	poolIdx, err := z.getPoolIdx(ctx, bucket, object, objInfo.Size)
 	if err != nil {
-		return err
+		logger.LogIf(ctx, fmt.Errorf("Unable to update replication metadata for %s/%s(%s): %w", bucket, objInfo.Name, objInfo.VersionID, err))
+	} else {
+		if err = z.serverPools[poolIdx].getHashedSet(object).updateObjectMeta(ctx, bucket, object, objInfo.UserDefined, ObjectOptions{
+			VersionID: objInfo.VersionID,
+		}); err != nil {
+			logger.LogIf(ctx, fmt.Errorf("Unable to update replication metadata for %s/%s(%s): %w", bucket, objInfo.Name, objInfo.VersionID, err))
+		}
 	}
-
-	defer func() {
-		if err != nil {
-			// block and abort remote upload upon failure.
-			attempts := 1
-			for attempts <= 3 {
-				aerr := c.AbortMultipartUpload(ctx, bucket, object, uploadID)
-				if aerr == nil {
-					return
-				}
-				logger.LogIf(ctx,
-					fmt.Errorf("Trying %s: Unable to cleanup failed multipart replication %s on remote %s/%s: %w - this may consume space on remote cluster",
-						humanize.Ordinal(attempts), uploadID, bucket, object, aerr))
-				attempts++
-				time.Sleep(time.Second)
-			}
-		}
-	}()
-
-	var (
-		hr    *hash.Reader
-		pInfo miniogo.ObjectPart
-	)
-
-	for _, partInfo := range objInfo.Parts {
-		hr, err = hash.NewReader(r, partInfo.ActualSize, "", "", partInfo.ActualSize)
-		if err != nil {
-			return err
-		}
-		pInfo, err = c.PutObjectPart(ctx, bucket, object, uploadID, partInfo.Number, hr, partInfo.ActualSize, "", "", opts.ServerSideEncryption)
-		if err != nil {
-			return err
-		}
-		if pInfo.Size != partInfo.ActualSize {
-			return fmt.Errorf("Part size mismatch: got %d, want %d", pInfo.Size, partInfo.ActualSize)
-		}
-		uploadedParts = append(uploadedParts, miniogo.CompletePart{
-			PartNumber: pInfo.PartNumber,
-			ETag:       pInfo.ETag,
-		})
-	}
-	_, err = c.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, miniogo.PutObjectOptions{
-		Internal: miniogo.AdvancedPutOptions{
-			SourceMTime: objInfo.ModTime,
-			// always set this to distinguish between `mc mirror` replication and serverside
-			ReplicationRequest: true,
-		},
+	sendEvent(eventArgs{
+		EventName:  eventName,
+		BucketName: bucket,
+		Object:     objInfo,
+		Host:       "Internal: [Replication]",
 	})
-	return err
 }
 
 // filterReplicationStatusMetadata filters replication status metadata for COPY
@@ -1255,297 +762,98 @@ func filterReplicationStatusMetadata(metadata map[string]string) map[string]stri
 	return dst
 }
 
-// DeletedObjectReplicationInfo has info on deleted object
-type DeletedObjectReplicationInfo struct {
+// DeletedObjectVersionInfo has info on deleted object
+type DeletedObjectVersionInfo struct {
 	DeletedObject
-	Bucket    string
-	OpType    replication.Type
-	ResetID   string
-	TargetArn string
+	Bucket string
+}
+type replicationState struct {
+	// add future metrics here
+	replicaCh       chan ObjectInfo
+	replicaDeleteCh chan DeletedObjectVersionInfo
 }
 
-// Replication specific APIName
-const (
-	ReplicateObjectAPI = "ReplicateObject"
-	ReplicateDeleteAPI = "ReplicateDelete"
-)
+func (r *replicationState) queueReplicaTask(oi ObjectInfo) {
+	if r == nil {
+		return
+	}
+	select {
+	case r.replicaCh <- oi:
+	default:
+	}
+}
 
-const (
-	// ReplicateQueued - replication being queued trail
-	ReplicateQueued = "replicate:queue"
-
-	// ReplicateExisting - audit trail for existing objects replication
-	ReplicateExisting = "replicate:existing"
-	// ReplicateExistingDelete - audit trail for delete replication triggered for existing delete markers
-	ReplicateExistingDelete = "replicate:existing:delete"
-
-	// ReplicateMRF - audit trail for replication from Most Recent Failures (MRF) queue
-	ReplicateMRF = "replicate:mrf"
-	// ReplicateIncoming - audit trail indicating replication started [could be from incoming/existing/heal activity]
-	ReplicateIncoming = "replicate:incoming"
-	// ReplicateHeal - audit trail for healing of failed/pending replications
-	ReplicateHeal = "replicate:heal"
-	// ReplicateDelete - audit trail for delete replication
-	ReplicateDelete = "replicate:delete"
-)
+func (r *replicationState) queueReplicaDeleteTask(doi DeletedObjectVersionInfo) {
+	if r == nil {
+		return
+	}
+	select {
+	case r.replicaDeleteCh <- doi:
+	default:
+	}
+}
 
 var (
-	globalReplicationPool  *ReplicationPool
-	globalReplicationStats *ReplicationStats
+	globalReplicationState *replicationState
 )
 
-// ReplicationPool describes replication pool
-type ReplicationPool struct {
-	objLayer                ObjectLayer
-	ctx                     context.Context
-	mrfWorkerKillCh         chan struct{}
-	workerKillCh            chan struct{}
-	replicaCh               chan ReplicateObjectInfo
-	replicaDeleteCh         chan DeletedObjectReplicationInfo
-	mrfReplicaCh            chan ReplicateObjectInfo
-	existingReplicaCh       chan ReplicateObjectInfo
-	existingReplicaDeleteCh chan DeletedObjectReplicationInfo
-	workerSize              int
-	mrfWorkerSize           int
-	resyncState             replicationResyncState
-	workerWg                sync.WaitGroup
-	mrfWorkerWg             sync.WaitGroup
-	once                    sync.Once
-	mu                      sync.Mutex
-}
-
-// NewReplicationPool creates a pool of replication workers of specified size
-func NewReplicationPool(ctx context.Context, o ObjectLayer, opts replicationPoolOpts) *ReplicationPool {
-	pool := &ReplicationPool{
-		replicaCh:               make(chan ReplicateObjectInfo, 100000),
-		replicaDeleteCh:         make(chan DeletedObjectReplicationInfo, 100000),
-		mrfReplicaCh:            make(chan ReplicateObjectInfo, 100000),
-		workerKillCh:            make(chan struct{}, opts.Workers),
-		mrfWorkerKillCh:         make(chan struct{}, opts.FailedWorkers),
-		existingReplicaCh:       make(chan ReplicateObjectInfo, 100000),
-		existingReplicaDeleteCh: make(chan DeletedObjectReplicationInfo, 100000),
-		resyncState:             replicationResyncState{statusMap: make(map[string]BucketReplicationResyncStatus)},
-		ctx:                     ctx,
-		objLayer:                o,
+func newReplicationState() *replicationState {
+	rs := &replicationState{
+		replicaCh:       make(chan ObjectInfo, 10000),
+		replicaDeleteCh: make(chan DeletedObjectVersionInfo, 10000),
 	}
-
-	pool.ResizeWorkers(opts.Workers)
-	pool.ResizeFailedWorkers(opts.FailedWorkers)
-	go pool.AddExistingObjectReplicateWorker()
-	go pool.periodicResyncMetaSave(ctx, o)
-	return pool
+	go func() {
+		<-GlobalContext.Done()
+		close(rs.replicaCh)
+		close(rs.replicaDeleteCh)
+	}()
+	return rs
 }
 
-// AddMRFWorker adds a pending/failed replication worker to handle requests that could not be queued
-// to the other workers
-func (p *ReplicationPool) AddMRFWorker() {
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case oi, ok := <-p.mrfReplicaCh:
-			if !ok {
+// addWorker creates a new worker to process tasks
+func (r *replicationState) addWorker(ctx context.Context, objectAPI ObjectLayer) {
+	// Add a new worker.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
 				return
+			case oi, ok := <-r.replicaCh:
+				if !ok {
+					return
+				}
+				replicateObject(ctx, oi, objectAPI)
+			case doi, ok := <-r.replicaDeleteCh:
+				if !ok {
+					return
+				}
+				replicateDelete(ctx, doi, objectAPI)
 			}
-			replicateObject(p.ctx, oi, p.objLayer, ReplicateMRF)
-		case <-p.mrfWorkerKillCh:
-			return
 		}
-	}
-}
-
-// AddWorker adds a replication worker to the pool
-func (p *ReplicationPool) AddWorker() {
-	defer p.workerWg.Done()
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case oi, ok := <-p.replicaCh:
-			if !ok {
-				return
-			}
-			replicateObject(p.ctx, oi, p.objLayer, ReplicateIncoming)
-		case doi, ok := <-p.replicaDeleteCh:
-			if !ok {
-				return
-			}
-			replicateDelete(p.ctx, doi, p.objLayer, ReplicateDelete)
-		case <-p.workerKillCh:
-			return
-		}
-	}
-}
-
-// AddExistingObjectReplicateWorker adds a worker to queue existing objects that need to be sync'd
-func (p *ReplicationPool) AddExistingObjectReplicateWorker() {
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case oi, ok := <-p.existingReplicaCh:
-			if !ok {
-				return
-			}
-			replicateObject(p.ctx, oi, p.objLayer, ReplicateExisting)
-		case doi, ok := <-p.existingReplicaDeleteCh:
-			if !ok {
-				return
-			}
-			replicateDelete(p.ctx, doi, p.objLayer, ReplicateExistingDelete)
-		}
-	}
-}
-
-// ResizeWorkers sets replication workers pool to new size
-func (p *ReplicationPool) ResizeWorkers(n int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for p.workerSize < n {
-		p.workerSize++
-		p.workerWg.Add(1)
-		go p.AddWorker()
-	}
-	for p.workerSize > n {
-		p.workerSize--
-		go func() { p.workerKillCh <- struct{}{} }()
-	}
-}
-
-// ResizeFailedWorkers sets replication failed workers pool size
-func (p *ReplicationPool) ResizeFailedWorkers(n int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for p.mrfWorkerSize < n {
-		p.mrfWorkerSize++
-		p.mrfWorkerWg.Add(1)
-		go p.AddMRFWorker()
-	}
-	for p.mrfWorkerSize > n {
-		p.mrfWorkerSize--
-		go func() { p.mrfWorkerKillCh <- struct{}{} }()
-	}
-}
-
-// suggestedWorkers recommends an increase in number of workers to meet replication load.
-func (p *ReplicationPool) suggestedWorkers(failQueue bool) int {
-	if failQueue {
-		return int(float64(p.mrfWorkerSize) * ReplicationWorkerMultiplier)
-	}
-	return int(float64(p.workerSize) * ReplicationWorkerMultiplier)
-}
-
-func (p *ReplicationPool) queueReplicaFailedTask(ri ReplicateObjectInfo) {
-	if p == nil {
-		return
-	}
-	select {
-	case <-GlobalContext.Done():
-		p.once.Do(func() {
-			close(p.replicaCh)
-			close(p.mrfReplicaCh)
-			close(p.existingReplicaCh)
-		})
-	case p.mrfReplicaCh <- ri:
-	default:
-		logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Replication failed workers could not keep up with healing failures - consider increasing number of replication failed workers with `mc admin config set api replication_failed_workers=%d`", p.suggestedWorkers(true)), replicationSubsystem)
-	}
-}
-
-func (p *ReplicationPool) queueReplicaTask(ri ReplicateObjectInfo) {
-	if p == nil {
-		return
-	}
-	var ch chan ReplicateObjectInfo
-	switch ri.OpType {
-	case replication.ExistingObjectReplicationType:
-		ch = p.existingReplicaCh
-	case replication.HealReplicationType:
-		fallthrough
-	default:
-		ch = p.replicaCh
-	}
-	select {
-	case <-GlobalContext.Done():
-		p.once.Do(func() {
-			close(p.replicaCh)
-			close(p.mrfReplicaCh)
-			close(p.existingReplicaCh)
-		})
-	case ch <- ri:
-	default:
-		logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Replication workers could not keep up with incoming traffic - consider increasing number of replication workers with `mc admin config set api replication_workers=%d`", p.suggestedWorkers(false)), replicationSubsystem)
-	}
-}
-
-func queueReplicateDeletesWrapper(doi DeletedObjectReplicationInfo, existingObjectResync ResyncDecision) {
-	for k, v := range existingObjectResync.targets {
-		if v.Replicate {
-			doi.ResetID = v.ResetID
-			doi.TargetArn = k
-
-			globalReplicationPool.queueReplicaDeleteTask(doi)
-		}
-	}
-}
-
-func (p *ReplicationPool) queueReplicaDeleteTask(doi DeletedObjectReplicationInfo) {
-	if p == nil {
-		return
-	}
-	var ch chan DeletedObjectReplicationInfo
-	switch doi.OpType {
-	case replication.ExistingObjectReplicationType:
-		ch = p.existingReplicaDeleteCh
-	case replication.HealReplicationType:
-		fallthrough
-	default:
-		ch = p.replicaDeleteCh
-	}
-
-	select {
-	case <-GlobalContext.Done():
-		p.once.Do(func() {
-			close(p.replicaDeleteCh)
-			close(p.existingReplicaDeleteCh)
-		})
-	case ch <- doi:
-	default:
-		logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Replication workers could not keep up with incoming traffic - consider increasing number of replication workers with `mc admin config set api replication_workers=%d`", p.suggestedWorkers(false)), replicationSubsystem)
-	}
-}
-
-type replicationPoolOpts struct {
-	Workers       int
-	FailedWorkers int
+	}()
 }
 
 func initBackgroundReplication(ctx context.Context, objectAPI ObjectLayer) {
-	globalReplicationPool = NewReplicationPool(ctx, objectAPI, replicationPoolOpts{
-		Workers:       globalAPIConfig.getReplicationWorkers(),
-		FailedWorkers: globalAPIConfig.getReplicationFailedWorkers(),
-	})
-	globalReplicationStats = NewReplicationStats(ctx, objectAPI)
-	go globalReplicationStats.loadInitialReplicationMetrics(ctx)
-}
+	if globalReplicationState == nil {
+		return
+	}
 
-type proxyResult struct {
-	Proxy bool
-	Err   error
+	// Start replication workers per count set in api config or MINIO_API_REPLICATION_WORKERS.
+	for i := 0; i < globalAPIConfig.getReplicationWorkers(); i++ {
+		globalReplicationState.addWorker(ctx, objectAPI)
+	}
 }
 
 // get Reader from replication target if active-active replication is in place and
 // this node returns a 404
-func proxyGetToReplicationTarget(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (gr *GetObjectReader, proxy proxyResult, err error) {
-	tgt, oi, proxy := proxyHeadToRepTarget(ctx, bucket, object, rs, opts, proxyTargets)
-	if !proxy.Proxy {
-		return nil, proxy, nil
+func proxyGetToReplicationTarget(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, proxy bool) {
+	tgt, oi, proxy, err := proxyHeadToRepTarget(ctx, bucket, object, opts)
+	if !proxy || err != nil {
+		return nil, false
 	}
-	fn, _, _, err := NewGetObjectReader(nil, oi, opts)
+	fn, off, length, err := NewGetObjectReader(rs, oi, opts)
 	if err != nil {
-		return nil, proxy, err
+		return nil, false
 	}
 	gopts := miniogo.GetObjectOptions{
 		VersionID:            opts.VersionID,
@@ -1553,680 +861,134 @@ func proxyGetToReplicationTarget(ctx context.Context, bucket, object string, rs 
 		Internal: miniogo.AdvancedGetOptions{
 			ReplicationProxyRequest: "true",
 		},
-		PartNumber: opts.PartNumber,
 	}
 	// get correct offsets for encrypted object
-	if rs != nil {
-		h, err := rs.ToHeader()
-		if err != nil {
-			return nil, proxy, err
+	if off >= 0 && length >= 0 {
+		if err := gopts.SetRange(off, off+length-1); err != nil {
+			return nil, false
 		}
-		gopts.Set(xhttp.Range, h)
 	}
 	// Make sure to match ETag when proxying.
 	if err = gopts.SetMatchETag(oi.ETag); err != nil {
-		return nil, proxy, err
+		return nil, false
 	}
 	c := miniogo.Core{Client: tgt.Client}
-	obj, _, h, err := c.GetObject(ctx, bucket, object, gopts)
+	obj, _, _, err := c.GetObject(ctx, bucket, object, gopts)
 	if err != nil {
-		return nil, proxy, err
+		return nil, false
 	}
 	closeReader := func() { obj.Close() }
-	reader, err := fn(obj, h, closeReader)
+
+	reader, err := fn(obj, h, opts.CheckPrecondFn, closeReader)
 	if err != nil {
-		return nil, proxy, err
+		return nil, false
 	}
 	reader.ObjInfo = oi.Clone()
-	if rs != nil {
-		contentSize, err := parseSizeFromContentRange(h)
-		if err != nil {
-			return nil, proxy, err
-		}
-		reader.ObjInfo.Size = contentSize
-	}
-
-	return reader, proxyResult{Proxy: true}, nil
+	return reader, true
 }
 
-func getproxyTargets(ctx context.Context, bucket, object string, opts ObjectOptions) (tgts *madmin.BucketTargets) {
+// isProxyable returns true if replication config found for this bucket
+func isProxyable(ctx context.Context, bucket string) bool {
 	cfg, err := getReplicationConfig(ctx, bucket)
-	if err != nil || cfg == nil {
-		return &madmin.BucketTargets{}
+	if err != nil {
+		return false
 	}
-	topts := replication.ObjectOpts{Name: object}
-	tgtArns := cfg.FilterTargetArns(topts)
-	tgts = &madmin.BucketTargets{Targets: make([]madmin.BucketTarget, len(tgtArns))}
-	for i, tgtArn := range tgtArns {
-		tgt := globalBucketTargetSys.GetRemoteBucketTargetByArn(ctx, bucket, tgtArn)
-		tgts.Targets[i] = tgt
-	}
-
-	return tgts
+	dest := cfg.GetDestination()
+	return dest.Bucket == bucket
 }
 
-func proxyHeadToRepTarget(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (tgt *TargetClient, oi ObjectInfo, proxy proxyResult) {
+func proxyHeadToRepTarget(ctx context.Context, bucket, object string, opts ObjectOptions) (tgt *TargetClient, oi ObjectInfo, proxy bool, err error) {
 	// this option is set when active-active replication is in place between site A -> B,
 	// and site B does not have the object yet.
 	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
-		return nil, oi, proxy
+		return nil, oi, false, nil
 	}
-	for _, t := range proxyTargets.Targets {
-		tgt = globalBucketTargetSys.GetRemoteTargetClient(ctx, t.Arn)
-		if tgt == nil || tgt.IsOffline() {
-			continue
-		}
-		// if proxying explicitly disabled on remote target
-		if tgt.disableProxy {
-			continue
-		}
-
-		gopts := miniogo.GetObjectOptions{
-			VersionID:            opts.VersionID,
-			ServerSideEncryption: opts.ServerSideEncryption,
-			Internal: miniogo.AdvancedGetOptions{
-				ReplicationProxyRequest: "true",
-			},
-			PartNumber: opts.PartNumber,
-		}
-		if rs != nil {
-			h, err := rs.ToHeader()
-			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("Invalid range header for %s/%s(%s) - %w", bucket, object, opts.VersionID, err))
-				continue
-			}
-			gopts.Set(xhttp.Range, h)
-		}
-
-		objInfo, err := tgt.StatObject(ctx, t.TargetBucket, object, gopts)
-		if err != nil {
-			if isErrInvalidRange(ErrorRespToObjectError(err, bucket, object)) {
-				return nil, oi, proxyResult{Err: err}
-			}
-			continue
-		}
-
-		tags, _ := tags.MapToObjectTags(objInfo.UserTags)
-		oi = ObjectInfo{
-			Bucket:                    bucket,
-			Name:                      object,
-			ModTime:                   objInfo.LastModified,
-			Size:                      objInfo.Size,
-			ETag:                      objInfo.ETag,
-			VersionID:                 objInfo.VersionID,
-			IsLatest:                  objInfo.IsLatest,
-			DeleteMarker:              objInfo.IsDeleteMarker,
-			ContentType:               objInfo.ContentType,
-			Expires:                   objInfo.Expires,
-			StorageClass:              objInfo.StorageClass,
-			ReplicationStatusInternal: objInfo.ReplicationStatus,
-			UserTags:                  tags.String(),
-		}
-		oi.UserDefined = make(map[string]string, len(objInfo.Metadata))
-		for k, v := range objInfo.Metadata {
-			oi.UserDefined[k] = v[0]
-		}
-		ce, ok := oi.UserDefined[xhttp.ContentEncoding]
-		if !ok {
-			ce, ok = oi.UserDefined[strings.ToLower(xhttp.ContentEncoding)]
-		}
-		if ok {
-			oi.ContentEncoding = ce
-		}
-		return tgt, oi, proxyResult{Proxy: true}
+	cfg, err := getReplicationConfig(ctx, bucket)
+	if err != nil {
+		return nil, oi, false, err
 	}
-	return nil, oi, proxy
+	dest := cfg.GetDestination()
+	if dest.Bucket != bucket { // not active-active
+		return nil, oi, false, err
+	}
+	ssec := false
+	if opts.ServerSideEncryption != nil {
+		ssec = opts.ServerSideEncryption.Type() == encrypt.SSEC
+	}
+	ropts := replication.ObjectOpts{
+		Name: object,
+		SSEC: ssec,
+	}
+	if !cfg.Replicate(ropts) { // no matching rule for object prefix
+		return nil, oi, false, nil
+	}
+	tgt = globalBucketTargetSys.GetRemoteTargetClient(ctx, cfg.RoleArn)
+	if tgt == nil || tgt.isOffline() {
+		return nil, oi, false, fmt.Errorf("target is offline or not configured")
+	}
+
+	gopts := miniogo.GetObjectOptions{
+		VersionID:            opts.VersionID,
+		ServerSideEncryption: opts.ServerSideEncryption,
+		Internal: miniogo.AdvancedGetOptions{
+			ReplicationProxyRequest: "true",
+		},
+	}
+
+	objInfo, err := tgt.StatObject(ctx, dest.Bucket, object, gopts)
+	if err != nil {
+		return nil, oi, false, err
+	}
+
+	tags, _ := tags.MapToObjectTags(objInfo.UserTags)
+	oi = ObjectInfo{
+		Bucket:            bucket,
+		Name:              object,
+		ModTime:           objInfo.LastModified,
+		Size:              objInfo.Size,
+		ETag:              objInfo.ETag,
+		VersionID:         objInfo.VersionID,
+		IsLatest:          objInfo.IsLatest,
+		DeleteMarker:      objInfo.IsDeleteMarker,
+		ContentType:       objInfo.ContentType,
+		Expires:           objInfo.Expires,
+		StorageClass:      objInfo.StorageClass,
+		ReplicationStatus: replication.StatusType(objInfo.ReplicationStatus),
+		UserTags:          tags.String(),
+	}
+	oi.UserDefined = make(map[string]string, len(objInfo.Metadata))
+	for k, v := range objInfo.Metadata {
+		oi.UserDefined[k] = v[0]
+	}
+	ce, ok := oi.UserDefined[xhttp.ContentEncoding]
+	if !ok {
+		ce, ok = oi.UserDefined[strings.ToLower(xhttp.ContentEncoding)]
+	}
+	if ok {
+		oi.ContentEncoding = ce
+	}
+	return tgt, oi, true, nil
 }
 
 // get object info from replication target if active-active replication is in place and
 // this node returns a 404
-func proxyHeadToReplicationTarget(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (oi ObjectInfo, proxy proxyResult) {
-	_, oi, proxy = proxyHeadToRepTarget(ctx, bucket, object, rs, opts, proxyTargets)
-	return oi, proxy
+func proxyHeadToReplicationTarget(ctx context.Context, bucket, object string, opts ObjectOptions) (oi ObjectInfo, proxy bool, err error) {
+	_, oi, proxy, err = proxyHeadToRepTarget(ctx, bucket, object, opts)
+	return oi, proxy, err
 }
 
-func scheduleReplication(ctx context.Context, objInfo ObjectInfo, o ObjectLayer, dsc ReplicateDecision, opType replication.Type) {
-	if dsc.Synchronous() {
-		replicateObject(ctx, ReplicateObjectInfo{ObjectInfo: objInfo, OpType: opType, Dsc: dsc}, o, ReplicateIncoming)
+func scheduleReplication(ctx context.Context, objInfo ObjectInfo, o ObjectLayer, sync bool) {
+	if sync {
+		replicateObject(ctx, objInfo, o)
 	} else {
-		globalReplicationPool.queueReplicaTask(ReplicateObjectInfo{ObjectInfo: objInfo, OpType: opType, Dsc: dsc})
-	}
-	if sz, err := objInfo.GetActualSize(); err == nil {
-		for arn := range dsc.targetsMap {
-			globalReplicationStats.Update(objInfo.Bucket, arn, sz, 0, objInfo.ReplicationStatus, replication.StatusType(""), opType)
-		}
+		globalReplicationState.queueReplicaTask(objInfo)
 	}
 }
 
-func scheduleReplicationDelete(ctx context.Context, dv DeletedObjectReplicationInfo, o ObjectLayer) {
-	globalReplicationPool.queueReplicaDeleteTask(dv)
-	for arn := range dv.ReplicationState.Targets {
-		globalReplicationStats.Update(dv.Bucket, arn, 0, 0, replication.Pending, replication.StatusType(""), replication.DeleteReplicationType)
+func scheduleReplicationDelete(ctx context.Context, dv DeletedObjectVersionInfo, o ObjectLayer, sync bool) {
+	if sync {
+		replicateDelete(ctx, dv, o)
+	} else {
+		globalReplicationState.queueReplicaDeleteTask(dv)
 	}
-	for arn := range dv.ReplicationState.PurgeTargets {
-		globalReplicationStats.Update(dv.Bucket, arn, 0, 0, replication.Pending, replication.StatusType(""), replication.DeleteReplicationType)
-	}
-}
-
-type replicationConfig struct {
-	Config  *replication.Config
-	remotes *madmin.BucketTargets
-}
-
-func (c replicationConfig) Empty() bool {
-	return c.Config == nil
-}
-
-func (c replicationConfig) Replicate(opts replication.ObjectOpts) bool {
-	return c.Config.Replicate(opts)
-}
-
-// Resync returns true if replication reset is requested
-func (c replicationConfig) Resync(ctx context.Context, oi ObjectInfo, dsc *ReplicateDecision, tgtStatuses map[string]replication.StatusType) (r ResyncDecision) {
-	if c.Empty() {
-		return
-	}
-	// existing object replication does not apply to un-versioned objects
-	if oi.VersionID == "" {
-		return
-	}
-
-	// Now overlay existing object replication choices for target
-	if oi.DeleteMarker {
-		opts := replication.ObjectOpts{
-			Name:           oi.Name,
-			SSEC:           crypto.SSEC.IsEncrypted(oi.UserDefined),
-			UserTags:       oi.UserTags,
-			DeleteMarker:   oi.DeleteMarker,
-			VersionID:      oi.VersionID,
-			OpType:         replication.DeleteReplicationType,
-			ExistingObject: true,
-		}
-
-		tgtArns := c.Config.FilterTargetArns(opts)
-		// indicates no matching target with Existing object replication enabled.
-		if len(tgtArns) == 0 {
-			return
-		}
-		for _, t := range tgtArns {
-			opts.TargetArn = t
-			// Update replication decision for target based on existing object replciation rule.
-			dsc.Set(newReplicateTargetDecision(t, c.Replicate(opts), false))
-		}
-		return c.resync(oi, dsc, tgtStatuses)
-	}
-
-	// Ignore previous replication status when deciding if object can be re-replicated
-	objInfo := oi.Clone()
-	objInfo.ReplicationStatusInternal = ""
-	objInfo.VersionPurgeStatusInternal = ""
-	objInfo.ReplicationStatus = ""
-	objInfo.VersionPurgeStatus = ""
-	resyncdsc := mustReplicate(ctx, oi.Bucket, oi.Name, getMustReplicateOptions(objInfo, replication.ExistingObjectReplicationType, ObjectOptions{}))
-	dsc = &resyncdsc
-	return c.resync(oi, dsc, tgtStatuses)
-}
-
-// wrapper function for testability. Returns true if a new reset is requested on
-// already replicated objects OR object qualifies for existing object replication
-// and no reset requested.
-func (c replicationConfig) resync(oi ObjectInfo, dsc *ReplicateDecision, tgtStatuses map[string]replication.StatusType) (r ResyncDecision) {
-	r = ResyncDecision{
-		targets: make(map[string]ResyncTargetDecision),
-	}
-	if c.remotes == nil {
-		return
-	}
-	for _, tgt := range c.remotes.Targets {
-		d, ok := dsc.targetsMap[tgt.Arn]
-		if !ok {
-			continue
-		}
-		if !d.Replicate {
-			continue
-		}
-		r.targets[d.Arn] = resyncTarget(oi, tgt.Arn, tgt.ResetID, tgt.ResetBeforeDate, tgtStatuses[tgt.Arn])
-	}
-	return
-}
-
-func targetResetHeader(arn string) string {
-	return fmt.Sprintf("%s-%s", ReservedMetadataPrefixLower+ReplicationReset, arn)
-}
-
-func resyncTarget(oi ObjectInfo, arn string, resetID string, resetBeforeDate time.Time, tgtStatus replication.StatusType) (rd ResyncTargetDecision) {
-	rd = ResyncTargetDecision{
-		ResetID:         resetID,
-		ResetBeforeDate: resetBeforeDate,
-	}
-	rs, ok := oi.UserDefined[targetResetHeader(arn)]
-	if !ok {
-		rs, ok = oi.UserDefined[xhttp.MinIOReplicationResetStatus] // for backward compatibility
-	}
-	if !ok { // existing object replication is enabled and object version is unreplicated so far.
-		if resetID != "" && oi.ModTime.Before(resetBeforeDate) { // trigger replication if `mc replicate reset` requested
-			rd.Replicate = true
-			return
-		}
-		// For existing object reset - this condition is needed
-		rd.Replicate = tgtStatus == ""
-		return
-	}
-	if resetID == "" || resetBeforeDate.Equal(timeSentinel) { // no reset in progress
-		return
-	}
-
-	// if already replicated, return true if a new reset was requested.
-	splits := strings.SplitN(rs, ";", 2)
-	if len(splits) != 2 {
-		return
-	}
-	newReset := splits[1] != resetID
-	if !newReset && tgtStatus == replication.Completed {
-		// already replicated and no reset requested
-		return
-	}
-	rd.Replicate = newReset && oi.ModTime.Before(resetBeforeDate)
-	return
-}
-
-// get the most current of in-memory replication stats  and data usage info from crawler.
-func getLatestReplicationStats(bucket string, u BucketUsageInfo) (s BucketReplicationStats) {
-	bucketStats := globalNotificationSys.GetClusterBucketStats(GlobalContext, bucket)
-	// accumulate cluster bucket stats
-	stats := make(map[string]*BucketReplicationStat)
-	var totReplicaSize int64
-	for _, bucketStat := range bucketStats {
-		totReplicaSize += bucketStat.ReplicationStats.ReplicaSize
-		for arn, stat := range bucketStat.ReplicationStats.Stats {
-			oldst := stats[arn]
-			if oldst == nil {
-				oldst = &BucketReplicationStat{}
-			}
-			stats[arn] = &BucketReplicationStat{
-				FailedCount:    stat.FailedCount + oldst.FailedCount,
-				FailedSize:     stat.FailedSize + oldst.FailedSize,
-				ReplicatedSize: stat.ReplicatedSize + oldst.ReplicatedSize,
-				Latency:        stat.Latency.merge(oldst.Latency),
-			}
-		}
-	}
-
-	// add initial usage stat to cluster stats
-	usageStat := globalReplicationStats.GetInitialUsage(bucket)
-	totReplicaSize += usageStat.ReplicaSize
-	for arn, stat := range usageStat.Stats {
-		st, ok := stats[arn]
-		if !ok {
-			st = &BucketReplicationStat{}
-			stats[arn] = st
-		}
-		st.ReplicatedSize += stat.ReplicatedSize
-		st.FailedSize += stat.FailedSize
-		st.FailedCount += stat.FailedCount
-	}
-	s = BucketReplicationStats{
-		Stats: make(map[string]*BucketReplicationStat, len(stats)),
-	}
-	var latestTotReplicatedSize int64
-	for _, st := range u.ReplicationInfo {
-		latestTotReplicatedSize += int64(st.ReplicatedSize)
-	}
-	// normalize computed real time stats with latest usage stat
-	for arn, tgtstat := range stats {
-		st := BucketReplicationStat{}
-		bu, ok := u.ReplicationInfo[arn]
-		if !ok {
-			bu = BucketTargetUsageInfo{}
-		}
-		// use in memory replication stats if it is ahead of usage info.
-		st.ReplicatedSize = int64(bu.ReplicatedSize)
-		if tgtstat.ReplicatedSize >= int64(bu.ReplicatedSize) {
-			st.ReplicatedSize = tgtstat.ReplicatedSize
-		}
-		s.ReplicatedSize += st.ReplicatedSize
-		// Reset FailedSize and FailedCount to 0 for negative overflows which can
-		// happen since data usage picture can lag behind actual usage state at the time of cluster start
-		st.FailedSize = int64(math.Max(float64(tgtstat.FailedSize), 0))
-		st.FailedCount = int64(math.Max(float64(tgtstat.FailedCount), 0))
-		st.Latency = tgtstat.Latency
-
-		s.Stats[arn] = &st
-		s.FailedSize += st.FailedSize
-		s.FailedCount += st.FailedCount
-	}
-	// normalize overall stats
-	s.ReplicaSize = int64(math.Max(float64(totReplicaSize), float64(u.ReplicaSize)))
-	s.ReplicatedSize = int64(math.Max(float64(s.ReplicatedSize), float64(latestTotReplicatedSize)))
-	return s
-}
-
-const resyncTimeInterval = time.Minute * 10
-
-// periodicResyncMetaSave saves in-memory resync meta stats to disk in periodic intervals
-func (p *ReplicationPool) periodicResyncMetaSave(ctx context.Context, objectAPI ObjectLayer) {
-	resyncTimer := time.NewTimer(resyncTimeInterval)
-	defer resyncTimer.Stop()
-
-	for {
-		select {
-		case <-resyncTimer.C:
-			resyncTimer.Reset(resyncTimeInterval)
-			now := UTCNow()
-			p.resyncState.RLock()
-			for bucket, brs := range p.resyncState.statusMap {
-				var updt bool
-				for _, st := range brs.TargetsMap {
-					// if resync in progress or just ended, needs to save to disk
-					if st.EndTime.Equal(timeSentinel) || now.Sub(st.EndTime) <= resyncTimeInterval {
-						updt = true
-						break
-					}
-				}
-				if updt {
-					brs.LastUpdate = now
-					if err := saveResyncStatus(ctx, bucket, brs, objectAPI); err != nil {
-						logger.LogIf(ctx, fmt.Errorf("Could not save resync metadata to disk for %s - %w", bucket, err))
-						continue
-					}
-				}
-			}
-			p.resyncState.RUnlock()
-		case <-ctx.Done():
-			// server could be restarting - need
-			// to exit immediately
-			return
-		}
-	}
-}
-
-// resyncBucket resyncs all qualifying objects as per replication rules for the target
-// ARN
-func resyncBucket(ctx context.Context, bucket, arn string, heal bool, objectAPI ObjectLayer) {
-	resyncStatus := ResyncFailed
-	defer func() {
-		globalReplicationPool.resyncState.Lock()
-		m := globalReplicationPool.resyncState.statusMap[bucket]
-		st := m.TargetsMap[arn]
-		st.EndTime = UTCNow()
-		st.ResyncStatus = resyncStatus
-		m.TargetsMap[arn] = st
-		globalReplicationPool.resyncState.Unlock()
-	}()
-	// Allocate new results channel to receive ObjectInfo.
-	objInfoCh := make(chan ObjectInfo)
-	cfg, err := getReplicationConfig(ctx, bucket)
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Replication resync of %s for arn %s failed with %w", bucket, arn, err))
-		return
-	}
-	tgts, err := globalBucketTargetSys.ListBucketTargets(ctx, bucket)
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Replication resync of %s for arn %s failed  %w", bucket, arn, err))
-		return
-	}
-	rcfg := replicationConfig{
-		Config:  cfg,
-		remotes: tgts,
-	}
-	tgtArns := cfg.FilterTargetArns(
-		replication.ObjectOpts{
-			OpType:    replication.ResyncReplicationType,
-			TargetArn: arn,
-		})
-	if len(tgtArns) != 1 {
-		logger.LogIf(ctx, fmt.Errorf("Replication resync failed for %s - arn specified %s is missing in the replication config", bucket, arn))
-		return
-	}
-	tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, arn)
-	if tgt == nil {
-		logger.LogIf(ctx, fmt.Errorf("Replication resync failed for %s - target could not be created for arn %s", bucket, arn))
-		return
-	}
-
-	// Walk through all object versions - note ascending order of walk needed to ensure delete marker replicated to
-	// target after object version is first created.
-	if err := objectAPI.Walk(ctx, bucket, "", objInfoCh, ObjectOptions{WalkAscending: true}); err != nil {
-		logger.LogIf(ctx, err)
-		return
-	}
-
-	globalReplicationPool.resyncState.RLock()
-	m := globalReplicationPool.resyncState.statusMap[bucket]
-	st := m.TargetsMap[arn]
-	globalReplicationPool.resyncState.RUnlock()
-	var lastCheckpoint string
-	if st.ResyncStatus == ResyncStarted || st.ResyncStatus == ResyncFailed {
-		lastCheckpoint = st.Object
-	}
-	for obj := range objInfoCh {
-		if heal && lastCheckpoint != "" && lastCheckpoint != obj.Name {
-			continue
-		}
-		lastCheckpoint = ""
-
-		roi := getHealReplicateObjectInfo(obj, rcfg)
-		if !roi.ExistingObjResync.mustResync() {
-			continue
-		}
-
-		if roi.DeleteMarker || !roi.VersionPurgeStatus.Empty() {
-
-			versionID := ""
-			dmVersionID := ""
-			if roi.VersionPurgeStatus.Empty() {
-				dmVersionID = roi.VersionID
-			} else {
-				versionID = roi.VersionID
-			}
-
-			doi := DeletedObjectReplicationInfo{
-				DeletedObject: DeletedObject{
-					ObjectName:            roi.Name,
-					DeleteMarkerVersionID: dmVersionID,
-					VersionID:             versionID,
-					ReplicationState:      roi.getReplicationState(roi.Dsc.String(), versionID, true),
-					DeleteMarkerMTime:     DeleteMarkerMTime{roi.ModTime},
-					DeleteMarker:          roi.DeleteMarker,
-				},
-				Bucket: roi.Bucket,
-				OpType: replication.ExistingObjectReplicationType,
-			}
-			replicateDelete(ctx, doi, objectAPI, ReplicateDelete)
-		} else {
-			roi.OpType = replication.ExistingObjectReplicationType
-			replicateObject(ctx, roi, objectAPI, ReplicateExisting)
-		}
-		_, err = tgt.StatObject(ctx, tgt.Bucket, roi.Name, miniogo.StatObjectOptions{
-			VersionID: roi.VersionID,
-			Internal: miniogo.AdvancedGetOptions{
-				ReplicationProxyRequest: "false",
-			},
-		})
-		globalReplicationPool.resyncState.Lock()
-		m = globalReplicationPool.resyncState.statusMap[bucket]
-		st = m.TargetsMap[arn]
-		st.Object = roi.Name
-		if err != nil {
-			if roi.DeleteMarker && isErrMethodNotAllowed(ErrorRespToObjectError(err, bucket, roi.Name)) {
-				st.ReplicatedCount++
-			} else {
-				st.FailedCount++
-			}
-		} else {
-			st.ReplicatedCount++
-			st.ReplicatedSize += roi.Size
-		}
-		m.TargetsMap[arn] = st
-		globalReplicationPool.resyncState.Unlock()
-	}
-	resyncStatus = ResyncCompleted
-}
-
-// start replication resync for the remote target ARN specified
-func startReplicationResync(ctx context.Context, bucket, arn, resyncID string, resyncBeforeDate time.Time, objAPI ObjectLayer) error {
-	if bucket == "" {
-		return fmt.Errorf("bucket name is empty")
-	}
-	if arn == "" {
-		return fmt.Errorf("target ARN specified for resync is empty")
-	}
-	// Check if the current bucket has quota restrictions, if not skip it
-	cfg, err := getReplicationConfig(ctx, bucket)
-	if err != nil {
-		return err
-	}
-	tgtArns := cfg.FilterTargetArns(
-		replication.ObjectOpts{
-			OpType:    replication.ResyncReplicationType,
-			TargetArn: arn,
-		})
-
-	if len(tgtArns) == 0 {
-		return fmt.Errorf("arn %s specified for resync not found in replication config", arn)
-	}
-
-	data, err := loadBucketResyncMetadata(ctx, bucket, objAPI)
-	if err != nil {
-		return err
-	}
-	// validate if resync is in progress for this arn
-	for tArn, st := range data.TargetsMap {
-		if arn == tArn && st.ResyncStatus == ResyncStarted {
-			return fmt.Errorf("Resync of bucket %s is already in progress for remote bucket %s", bucket, arn)
-		}
-	}
-
-	status := TargetReplicationResyncStatus{
-		ResyncID:         resyncID,
-		ResyncBeforeDate: resyncBeforeDate,
-		StartTime:        UTCNow(),
-		ResyncStatus:     ResyncStarted,
-		Bucket:           bucket,
-	}
-	data.TargetsMap[arn] = status
-	if err = saveResyncStatus(ctx, bucket, data, objAPI); err != nil {
-		return err
-	}
-	globalReplicationPool.resyncState.Lock()
-	defer globalReplicationPool.resyncState.Unlock()
-	brs, ok := globalReplicationPool.resyncState.statusMap[bucket]
-	if !ok {
-		brs = BucketReplicationResyncStatus{
-			Version:    resyncMetaVersion,
-			TargetsMap: make(map[string]TargetReplicationResyncStatus),
-		}
-	}
-	brs.TargetsMap[arn] = status
-	globalReplicationPool.resyncState.statusMap[bucket] = brs
-	go resyncBucket(GlobalContext, bucket, arn, false, objAPI)
-	return nil
-}
-
-// delete resync metadata from replication resync state in memory
-func (p *ReplicationPool) deleteResyncMetadata(ctx context.Context, bucket string) {
-	if p == nil {
-		return
-	}
-	p.resyncState.Lock()
-	delete(p.resyncState.statusMap, bucket)
-	defer p.resyncState.Unlock()
-}
-
-// initResync - initializes bucket replication resync for all buckets.
-func (p *ReplicationPool) initResync(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) error {
-	if objAPI == nil {
-		return errServerNotInitialized
-	}
-	// replication applies only to erasure coded setups
-	if !globalIsErasure {
-		return nil
-	}
-	// Load bucket metadata sys in background
-	go p.loadResync(ctx, buckets, objAPI)
-	return nil
-}
-
-// Loads bucket replication resync statuses into memory.
-func (p *ReplicationPool) loadResync(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) {
-	for index := range buckets {
-		meta, err := loadBucketResyncMetadata(ctx, buckets[index].Name, objAPI)
-		if err != nil {
-			if errors.Is(err, errVolumeNotFound) {
-				meta = newBucketResyncStatus(buckets[index].Name)
-			} else {
-				logger.LogIf(ctx, err)
-				continue
-			}
-		}
-		p.resyncState.statusMap[buckets[index].Name] = meta
-	}
-	for index := range buckets {
-		bucket := buckets[index].Name
-		m, ok := p.resyncState.statusMap[bucket]
-		if ok {
-			for arn, st := range m.TargetsMap {
-				if st.ResyncStatus == ResyncFailed || st.ResyncStatus == ResyncStarted {
-					go resyncBucket(ctx, bucket, arn, true, objAPI)
-				}
-			}
-		}
-	}
-}
-
-// load bucket resync metadata from disk
-func loadBucketResyncMetadata(ctx context.Context, bucket string, objAPI ObjectLayer) (brs BucketReplicationResyncStatus, e error) {
-	brs = newBucketResyncStatus(bucket)
-
-	resyncDirPath := path.Join(bucketMetaPrefix, bucket, replicationDir)
-	data, err := readConfig(GlobalContext, objAPI, pathJoin(resyncDirPath, resyncFileName))
-	if err != nil && err != errConfigNotFound {
-		return brs, err
-	}
-	if len(data) == 0 {
-		// Seems to be empty.
-		return brs, nil
-	}
-	if len(data) <= 4 {
-		return brs, fmt.Errorf("replication resync: no data")
-	}
-	// Read resync meta header
-	switch binary.LittleEndian.Uint16(data[0:2]) {
-	case resyncMetaFormat:
-	default:
-		return brs, fmt.Errorf("resyncMeta: unknown format: %d", binary.LittleEndian.Uint16(data[0:2]))
-	}
-	switch binary.LittleEndian.Uint16(data[2:4]) {
-	case resyncMetaVersion:
-	default:
-		return brs, fmt.Errorf("resyncMeta: unknown version: %d", binary.LittleEndian.Uint16(data[2:4]))
-	}
-	// OK, parse data.
-	if _, err = brs.UnmarshalMsg(data[4:]); err != nil {
-		return brs, err
-	}
-
-	switch brs.Version {
-	case resyncMetaVersionV1:
-	default:
-		return brs, fmt.Errorf("unexpected resync meta version: %d", brs.Version)
-	}
-	return brs, nil
-}
-
-// save resync status to resync.bin
-func saveResyncStatus(ctx context.Context, bucket string, brs BucketReplicationResyncStatus, objectAPI ObjectLayer) error {
-	data := make([]byte, 4, brs.Msgsize()+4)
-
-	// Initialize the resync meta header.
-	binary.LittleEndian.PutUint16(data[0:2], resyncMetaFormat)
-	binary.LittleEndian.PutUint16(data[2:4], resyncMetaVersion)
-
-	buf, err := brs.MarshalMsg(data)
-	if err != nil {
-		return err
-	}
-
-	configFile := path.Join(bucketMetaPrefix, bucket, replicationDir, resyncFileName)
-	return saveConfig(ctx, objectAPI, configFile, buf)
 }

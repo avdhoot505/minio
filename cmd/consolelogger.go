@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -22,24 +21,34 @@ import (
 	"context"
 	"sync"
 
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/logger/message/log"
-	"github.com/minio/minio/internal/logger/target/console"
-	"github.com/minio/minio/internal/logger/target/types"
-	"github.com/minio/minio/internal/pubsub"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/cmd/logger/message/log"
+	"github.com/minio/minio/cmd/logger/target/console"
+	xnet "github.com/minio/minio/pkg/net"
+	"github.com/minio/minio/pkg/pubsub"
 )
 
 // number of log messages to buffer
 const defaultLogBufferCount = 10000
 
-// HTTPConsoleLoggerSys holds global console logger state
+//HTTPConsoleLoggerSys holds global console logger state
 type HTTPConsoleLoggerSys struct {
 	sync.RWMutex
 	pubsub   *pubsub.PubSub
 	console  *console.Target
 	nodeName string
 	logBuf   *ring.Ring
+}
+
+func mustGetNodeName(endpointServerPools EndpointServerPools) (nodeName string) {
+	host, err := xnet.ParseHost(GetLocalPeer(endpointServerPools))
+	if err != nil {
+		logger.FatalIf(err, "Unable to start console logging subsystem")
+	}
+	if globalIsDistErasure {
+		nodeName = host.Name
+	}
+	return nodeName
 }
 
 // NewConsoleLogger - creates new HTTPConsoleLoggerSys with all nodes subscribed to
@@ -54,18 +63,8 @@ func NewConsoleLogger(ctx context.Context) *HTTPConsoleLoggerSys {
 }
 
 // SetNodeName - sets the node name if any after distributed setup has initialized
-func (sys *HTTPConsoleLoggerSys) SetNodeName(nodeName string) {
-	if !globalIsDistErasure {
-		sys.nodeName = ""
-		return
-	}
-
-	host, err := xnet.ParseHost(globalLocalNodeName)
-	if err != nil {
-		logger.FatalIf(err, "Unable to start console logging subsystem")
-	}
-
-	sys.nodeName = host.Name
+func (sys *HTTPConsoleLoggerSys) SetNodeName(endpointServerPools EndpointServerPools) {
+	sys.nodeName = mustGetNodeName(endpointServerPools)
 }
 
 // HasLogListeners returns true if console log listeners are registered
@@ -78,7 +77,7 @@ func (sys *HTTPConsoleLoggerSys) HasLogListeners() bool {
 func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan struct{}, node string, last int, logKind string, filter func(entry interface{}) bool) {
 	// Enable console logging for remote client.
 	if !sys.HasLogListeners() {
-		logger.AddSystemTarget(sys)
+		logger.AddTarget(sys)
 	}
 
 	cnt := 0
@@ -118,8 +117,8 @@ func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan
 	sys.pubsub.Subscribe(subCh, doneCh, filter)
 }
 
-// Init if HTTPConsoleLoggerSys is valid, always returns nil right now
-func (sys *HTTPConsoleLoggerSys) Init() error {
+// Validate if HTTPConsoleLoggerSys is valid, always returns nil right now
+func (sys *HTTPConsoleLoggerSys) Validate() error {
 	return nil
 }
 
@@ -130,7 +129,7 @@ func (sys *HTTPConsoleLoggerSys) Endpoint() string {
 
 // String - stringer function for interface compatibility
 func (sys *HTTPConsoleLoggerSys) String() string {
-	return logger.ConsoleLoggerTgt
+	return "console+http"
 }
 
 // Content returns the console stdout log
@@ -149,15 +148,6 @@ func (sys *HTTPConsoleLoggerSys) Content() (logs []log.Entry) {
 	sys.RUnlock()
 
 	return
-}
-
-// Cancel - cancels the target
-func (sys *HTTPConsoleLoggerSys) Cancel() {
-}
-
-// Type - returns type of the target
-func (sys *HTTPConsoleLoggerSys) Type() types.TargetType {
-	return types.TargetConsole
 }
 
 // Send log message 'e' to console and publish to console

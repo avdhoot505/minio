@@ -1,11 +1,11 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2017-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -36,17 +35,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/minio/pkg/env"
+
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/dustin/go-humanize"
+	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/cli"
-	"github.com/minio/madmin-go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
+	sha256 "github.com/minio/sha256-simd"
+
 	minio "github.com/minio/minio/cmd"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
-	"github.com/minio/pkg/bucket/policy/condition"
-	"github.com/minio/pkg/env"
 )
 
 const (
@@ -137,14 +139,14 @@ func (g *Azure) Name() string {
 }
 
 // NewGatewayLayer initializes azure blob storage client and returns AzureObjects.
-func (g *Azure) NewGatewayLayer(creds madmin.Credentials) (minio.ObjectLayer, error) {
+func (g *Azure) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
 	var err error
 
 	// Override credentials from the Azure storage environment variables if specified
 	if acc, key := env.Get("AZURE_STORAGE_ACCOUNT", creds.AccessKey), env.Get("AZURE_STORAGE_KEY", creds.SecretKey); acc != "" && key != "" {
-		creds = madmin.Credentials{
-			AccessKey: acc,
-			SecretKey: key,
+		creds, err = auth.CreateCredentials(acc, key)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -243,6 +245,11 @@ func parseStorageEndpoint(host string, accountName string) (*url.URL, error) {
 	return url.Parse(endpoint)
 }
 
+// Production - Azure gateway is production ready.
+func (g *Azure) Production() bool {
+	return true
+}
+
 // s3MetaToAzureProperties converts metadata meant for S3 PUT/COPY
 // object into Azure data structures - BlobMetadata and
 // BlobProperties.
@@ -274,7 +281,7 @@ func s3MetaToAzureProperties(ctx context.Context, s3Metadata map[string]string) 
 	encodeKey := func(key string) string {
 		tokens := strings.Split(key, "_")
 		for i := range tokens {
-			tokens[i] = strings.ReplaceAll(tokens[i], "-", "_")
+			tokens[i] = strings.Replace(tokens[i], "-", "_", -1)
 		}
 		return strings.Join(tokens, "__")
 	}
@@ -349,6 +356,7 @@ func azureTierToS3StorageClass(tierType string) string {
 	default:
 		return "STANDARD"
 	}
+
 }
 
 // azurePropertiesToS3Meta converts Azure metadata/properties to S3
@@ -366,7 +374,7 @@ func azurePropertiesToS3Meta(meta azblob.Metadata, props azblob.BlobHTTPHeaders,
 	decodeKey := func(key string) string {
 		tokens := strings.Split(key, "__")
 		for i := range tokens {
-			tokens[i] = strings.ReplaceAll(tokens[i], "_", "-")
+			tokens[i] = strings.Replace(tokens[i], "_", "-", -1)
 		}
 		return strings.Join(tokens, "_")
 	}
@@ -537,7 +545,7 @@ func (a *azureObjects) Shutdown(ctx context.Context) error {
 
 // StorageInfo - Not relevant to Azure backend.
 func (a *azureObjects) StorageInfo(ctx context.Context) (si minio.StorageInfo, _ []error) {
-	si.Backend.Type = madmin.Gateway
+	si.Backend.Type = minio.BackendGateway
 	host := a.endpoint.Host
 	if a.endpoint.Port() == "" {
 		host = a.endpoint.Host + ":" + a.endpoint.Scheme
@@ -577,6 +585,7 @@ func (a *azureObjects) GetBucketInfo(ctx context.Context, bucket string) (bi min
 		resp, err := a.client.ListContainersSegment(ctx, marker, azblob.ListContainersSegmentOptions{
 			Prefix: bucket,
 		})
+
 		if err != nil {
 			return bi, azureToObjectError(err, bucket)
 		}
@@ -602,6 +611,7 @@ func (a *azureObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketI
 
 	for marker.NotDone() {
 		resp, err := a.client.ListContainersSegment(ctx, marker, azblob.ListContainersSegmentOptions{})
+
 		if err != nil {
 			return nil, azureToObjectError(err)
 		}
@@ -620,8 +630,8 @@ func (a *azureObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketI
 }
 
 // DeleteBucket - delete a container on azure, uses Azure equivalent `ContainerURL.Delete`.
-func (a *azureObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
-	if !opts.Force {
+func (a *azureObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+	if !forceDelete {
 		// Check if the container is empty before deleting it.
 		result, err := a.ListObjects(ctx, bucket, "", "", "", 1)
 		if err != nil {
@@ -783,13 +793,9 @@ func (a *azureObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 		return nil, err
 	}
 
-	if startOffset != 0 || length != objInfo.Size {
-		delete(objInfo.UserDefined, "Content-MD5")
-	}
-
 	pr, pw := io.Pipe()
 	go func() {
-		err := a.getObject(ctx, bucket, object, startOffset, length, pw, objInfo.InnerETag, opts)
+		err := a.GetObject(ctx, bucket, object, startOffset, length, pw, objInfo.InnerETag, opts)
 		pw.CloseWithError(err)
 	}()
 	// Setup cleanup function to cause the above go-routine to
@@ -804,7 +810,7 @@ func (a *azureObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 //
 // startOffset indicates the starting read location of the object.
 // length indicates the total length of the object.
-func (a *azureObjects) getObject(ctx context.Context, bucket, object string, startOffset int64, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
+func (a *azureObjects) GetObject(ctx context.Context, bucket, object string, startOffset int64, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
 	// startOffset cannot be negative.
 	if startOffset < 0 {
 		return azureToObjectError(minio.InvalidRange{}, bucket, object)
@@ -1072,8 +1078,7 @@ func (a *azureObjects) NewMultipartUpload(ctx context.Context, bucket, object st
 }
 
 func (a *azureObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, uploadID string, partID int,
-	startOffset int64, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions,
-) (info minio.PartInfo, err error) {
+	startOffset int64, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (info minio.PartInfo, err error) {
 	return a.PutObjectPart(ctx, dstBucket, dstObject, uploadID, partID, srcInfo.PutObjReader, dstOpts)
 }
 
@@ -1417,7 +1422,6 @@ func (a *azureObjects) GetBucketPolicy(ctx context.Context, bucket string) (*pol
 		Version: policy.DefaultVersion,
 		Statements: []policy.Statement{
 			policy.NewStatement(
-				"",
 				policy.Allow,
 				policy.NewPrincipal("*"),
 				policy.NewActionSet(

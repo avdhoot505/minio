@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -28,11 +27,10 @@ import (
 	"net/url"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 // adminErasureTestBed - encapsulates subsystems that need to be setup for
@@ -41,13 +39,11 @@ type adminErasureTestBed struct {
 	erasureDirs []string
 	objLayer    ObjectLayer
 	router      *mux.Router
-	done        context.CancelFunc
 }
 
 // prepareAdminErasureTestBed - helper function that setups a single-node
 // Erasure backend for admin-handler tests.
 func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, error) {
-	ctx, cancel := context.WithCancel(ctx)
 
 	// reset global variables to start afresh.
 	resetTestGlobals()
@@ -59,13 +55,11 @@ func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, erro
 	// Initializing objectLayer for HealFormatHandler.
 	objLayer, erasureDirs, xlErr := initTestErasureObjLayer(ctx)
 	if xlErr != nil {
-		cancel()
 		return nil, xlErr
 	}
 
 	// Initialize minio server config.
 	if err := newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
-		cancel()
 		return nil, err
 	}
 
@@ -74,28 +68,24 @@ func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, erro
 
 	globalEndpoints = mustGetPoolEndpoints(erasureDirs...)
 
-	initAllSubsystems()
+	newAllSubsystems()
 
-	initConfigSubsystem(ctx, objLayer)
-
-	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
+	initAllSubsystems(ctx, objLayer)
 
 	// Setup admin mgmt REST API handlers.
 	adminRouter := mux.NewRouter()
-	registerAdminRouter(adminRouter, true)
+	registerAdminRouter(adminRouter, true, true)
 
 	return &adminErasureTestBed{
 		erasureDirs: erasureDirs,
 		objLayer:    objLayer,
 		router:      adminRouter,
-		done:        cancel,
 	}, nil
 }
 
 // TearDown - method that resets the test bed for subsequent unit
 // tests to start afresh.
 func (atb *adminErasureTestBed) TearDown() {
-	atb.done()
 	removeRoots(atb.erasureDirs)
 	resetTestGlobals()
 }
@@ -189,7 +179,7 @@ func testServicesCmdHandler(cmd cmdType, t *testing.T) {
 
 	adminTestBed, err := prepareAdminErasureTestBed(ctx)
 	if err != nil {
-		t.Fatal("Failed to initialize a single node Erasure backend for admin handler tests.", err)
+		t.Fatal("Failed to initialize a single node Erasure backend for admin handler tests.")
 	}
 	defer adminTestBed.TearDown()
 
@@ -236,8 +226,8 @@ func TestServiceRestartHandler(t *testing.T) {
 
 // buildAdminRequest - helper function to build an admin API request.
 func buildAdminRequest(queryVal url.Values, method, path string,
-	contentLength int64, bodySeeker io.ReadSeeker) (*http.Request, error,
-) {
+	contentLength int64, bodySeeker io.ReadSeeker) (*http.Request, error) {
+
 	req, err := newTestRequest(method,
 		adminPathPrefix+adminAPIVersionPrefix+path+"?"+queryVal.Encode(),
 		contentLength, bodySeeker)
@@ -260,7 +250,7 @@ func TestAdminServerInfo(t *testing.T) {
 
 	adminTestBed, err := prepareAdminErasureTestBed(ctx)
 	if err != nil {
-		t.Fatal("Failed to initialize a single node Erasure backend for admin handler tests.", err)
+		t.Fatal("Failed to initialize a single node Erasure backend for admin handler tests.")
 	}
 
 	defer adminTestBed.TearDown()
@@ -380,4 +370,5 @@ func TestExtractHealInitParams(t *testing.T) {
 			}
 		}
 	}
+
 }

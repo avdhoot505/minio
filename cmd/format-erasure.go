@@ -1,39 +1,38 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"io/ioutil"
 	"reflect"
 	"sync"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/internal/color"
-	"github.com/minio/minio/internal/config"
-	"github.com/minio/minio/internal/config/storageclass"
-	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/sync/errgroup"
+	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/config/storageclass"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/color"
+	"github.com/minio/minio/pkg/sync/errgroup"
+	sha256 "github.com/minio/sha256-simd"
 )
 
 const (
@@ -122,13 +121,6 @@ type formatErasureV3 struct {
 	} `json:"xl"`
 }
 
-func (f *formatErasureV3) Drives() (drives int) {
-	for _, set := range f.Erasure.Sets {
-		drives += len(set)
-	}
-	return drives
-}
-
 func (f *formatErasureV3) Clone() *formatErasureV3 {
 	b, err := json.Marshal(f)
 	if err != nil {
@@ -162,9 +154,13 @@ func newFormatErasureV3(numSets int, setLen int) *formatErasureV3 {
 
 // Returns format Erasure version after reading `format.json`, returns
 // successfully the version only if the backend is Erasure.
-func formatGetBackendErasureVersion(b []byte) (string, error) {
+func formatGetBackendErasureVersion(formatPath string) (string, error) {
 	meta := &formatMetaV1{}
-	if err := json.Unmarshal(b, meta); err != nil {
+	b, err := ioutil.ReadFile(formatPath)
+	if err != nil {
+		return "", err
+	}
+	if err = json.Unmarshal(b, meta); err != nil {
 		return "", err
 	}
 	if meta.Version != formatMetaVersionV1 {
@@ -175,7 +171,7 @@ func formatGetBackendErasureVersion(b []byte) (string, error) {
 	}
 	// Erasure backend found, proceed to detect version.
 	format := &formatErasureVersionDetect{}
-	if err := json.Unmarshal(b, format); err != nil {
+	if err = json.Unmarshal(b, format); err != nil {
 		return "", err
 	}
 	return format.Erasure.Version, nil
@@ -184,63 +180,50 @@ func formatGetBackendErasureVersion(b []byte) (string, error) {
 // Migrates all previous versions to latest version of `format.json`,
 // this code calls migration in sequence, such as V1 is migrated to V2
 // first before it V2 migrates to V3.n
-func formatErasureMigrate(export string) ([]byte, fs.FileInfo, error) {
+func formatErasureMigrate(export string) error {
 	formatPath := pathJoin(export, minioMetaBucket, formatConfigFile)
-	formatData, formatFi, err := xioutil.ReadFileWithFileInfo(formatPath)
+	version, err := formatGetBackendErasureVersion(formatPath)
 	if err != nil {
-		return nil, nil, err
+		return fmt.Errorf("Disk %s: %w", export, err)
 	}
-
-	version, err := formatGetBackendErasureVersion(formatData)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Disk %s: %w", export, err)
-	}
-
-	migrate := func(formatPath string, formatData []byte) ([]byte, fs.FileInfo, error) {
-		if err = ioutil.WriteFile(formatPath, formatData, 0o666); err != nil {
-			return nil, nil, err
-		}
-		formatFi, err := Lstat(formatPath)
-		if err != nil {
-			return nil, nil, err
-		}
-		return formatData, formatFi, nil
-	}
-
 	switch version {
 	case formatErasureVersionV1:
-		formatData, err = formatErasureMigrateV1ToV2(formatData, version)
-		if err != nil {
-			return nil, nil, fmt.Errorf("Disk %s: %w", export, err)
+		if err = formatErasureMigrateV1ToV2(export, version); err != nil {
+			return fmt.Errorf("Disk %s: %w", export, err)
 		}
 		// Migrate successful v1 => v2, proceed to v2 => v3
 		version = formatErasureVersionV2
 		fallthrough
 	case formatErasureVersionV2:
-		formatData, err = formatErasureMigrateV2ToV3(formatData, export, version)
-		if err != nil {
-			return nil, nil, fmt.Errorf("Disk %s: %w", export, err)
+		if err = formatErasureMigrateV2ToV3(export, version); err != nil {
+			return fmt.Errorf("Disk %s: %w", export, err)
 		}
 		// Migrate successful v2 => v3, v3 is latest
 		// version = formatXLVersionV3
-		return migrate(formatPath, formatData)
+		fallthrough
 	case formatErasureVersionV3:
 		// v3 is the latest version, return.
-		return formatData, formatFi, nil
+		return nil
 	}
-	return nil, nil, fmt.Errorf(`Disk %s: unknown format version %s`, export, version)
+	return fmt.Errorf(`Disk %s: unknown format version %s`, export, version)
 }
 
 // Migrates version V1 of format.json to version V2 of format.json,
 // migration fails upon any error.
-func formatErasureMigrateV1ToV2(data []byte, version string) ([]byte, error) {
+func formatErasureMigrateV1ToV2(export, version string) error {
 	if version != formatErasureVersionV1 {
-		return nil, fmt.Errorf(`format version expected %s, found %s`, formatErasureVersionV1, version)
+		return fmt.Errorf(`format version expected %s, found %s`, formatErasureVersionV1, version)
 	}
 
+	formatPath := pathJoin(export, minioMetaBucket, formatConfigFile)
+
 	formatV1 := &formatErasureV1{}
-	if err := json.Unmarshal(data, formatV1); err != nil {
-		return nil, err
+	b, err := ioutil.ReadFile(formatPath)
+	if err != nil {
+		return err
+	}
+	if err = json.Unmarshal(b, formatV1); err != nil {
+		return err
 	}
 
 	formatV2 := &formatErasureV2{}
@@ -253,43 +236,58 @@ func formatErasureMigrateV1ToV2(data []byte, version string) ([]byte, error) {
 	formatV2.Erasure.Sets[0] = make([]string, len(formatV1.Erasure.JBOD))
 	copy(formatV2.Erasure.Sets[0], formatV1.Erasure.JBOD)
 
-	return json.Marshal(formatV2)
+	b, err = json.Marshal(formatV2)
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(formatPath, b, 0644)
 }
 
 // Migrates V2 for format.json to V3 (Flat hierarchy for multipart)
-func formatErasureMigrateV2ToV3(data []byte, export, version string) ([]byte, error) {
+func formatErasureMigrateV2ToV3(export, version string) error {
 	if version != formatErasureVersionV2 {
-		return nil, fmt.Errorf(`format version expected %s, found %s`, formatErasureVersionV2, version)
+		return fmt.Errorf(`format version expected %s, found %s`, formatErasureVersionV2, version)
 	}
 
+	formatPath := pathJoin(export, minioMetaBucket, formatConfigFile)
 	formatV2 := &formatErasureV2{}
-	if err := json.Unmarshal(data, formatV2); err != nil {
-		return nil, err
+	b, err := ioutil.ReadFile(formatPath)
+	if err != nil {
+		return err
+	}
+	err = json.Unmarshal(b, formatV2)
+	if err != nil {
+		return err
 	}
 
-	tmpOld := pathJoin(export, minioMetaTmpDeletedBucket, mustGetUUID())
-	if err := renameAll(pathJoin(export, minioMetaMultipartBucket),
-		tmpOld); err != nil && err != errFileNotFound {
-		logger.LogIf(GlobalContext, fmt.Errorf("unable to rename (%s -> %s) %w, drive may be faulty please investigate",
-			pathJoin(export, minioMetaMultipartBucket),
-			tmpOld,
-			osErrToFileErr(err)))
+	if err = removeAll(pathJoin(export, minioMetaMultipartBucket)); err != nil {
+		return err
+	}
+
+	if err = mkdirAll(pathJoin(export, minioMetaMultipartBucket), 0755); err != nil {
+		return err
 	}
 
 	// format-V2 struct is exactly same as format-V1 except that version is "3"
 	// which indicates the simplified multipart backend.
 	formatV3 := formatErasureV3{}
+
 	formatV3.Version = formatV2.Version
 	formatV3.Format = formatV2.Format
 	formatV3.Erasure = formatV2.Erasure
+
 	formatV3.Erasure.Version = formatErasureVersionV3
 
-	return json.Marshal(formatV3)
+	b, err = json.Marshal(formatV3)
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(formatPath, b, 0644)
 }
 
 // countErrs - count a specific error.
 func countErrs(errs []error, err error) int {
-	i := 0
+	var i = 0
 	for _, err1 := range errs {
 		if err1 == err {
 			i++
@@ -314,7 +312,7 @@ func loadFormatErasureAll(storageDisks []StorageAPI, heal bool) ([]*formatErasur
 	g := errgroup.WithNErrs(len(storageDisks))
 
 	// Initialize format configs.
-	formats := make([]*formatErasureV3, len(storageDisks))
+	var formats = make([]*formatErasureV3, len(storageDisks))
 
 	// Load format from each disk in parallel
 	for index := range storageDisks {
@@ -339,6 +337,19 @@ func loadFormatErasureAll(storageDisks []StorageAPI, heal bool) ([]*formatErasur
 
 	// Return all formats and errors if any.
 	return formats, g.Wait()
+}
+
+func saveHealingTracker(disk StorageAPI, diskID string) error {
+	htracker := healingTracker{
+		ID: diskID,
+	}
+	htrackerBytes, err := htracker.MarshalMsg(nil)
+	if err != nil {
+		return err
+	}
+	return disk.WriteAll(context.TODO(), minioMetaBucket,
+		pathJoin(bucketMetaPrefix, slashSeparator, healingTrackerFilename),
+		htrackerBytes)
 }
 
 func saveFormatErasure(disk StorageAPI, format *formatErasureV3, heal bool) error {
@@ -375,11 +386,28 @@ func saveFormatErasure(disk StorageAPI, format *formatErasureV3, heal bool) erro
 
 	disk.SetDiskID(diskID)
 	if heal {
-		ctx := context.Background()
-		ht := newHealingTracker(disk)
-		return ht.save(ctx)
+		return saveHealingTracker(disk, diskID)
 	}
 	return nil
+}
+
+var ignoredHiddenDirectories = map[string]struct{}{
+	minioMetaBucket:             {}, // metabucket '.minio.sys'
+	".minio":                    {}, // users may choose to double down the backend as the config folder for certs
+	".snapshot":                 {}, // .snapshot for ignoring NetApp based persistent volumes WAFL snapshot
+	"lost+found":                {}, // 'lost+found' directory default on ext4 filesystems
+	"$RECYCLE.BIN":              {}, // windows specific directory for each drive (hidden)
+	"System Volume Information": {}, // windows specific directory for each drive (hidden)
+}
+
+func isHiddenDirectories(vols ...VolInfo) bool {
+	for _, vol := range vols {
+		if _, ok := ignoredHiddenDirectories[vol.Name]; ok {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // loadFormatErasure - loads format.json from disk.
@@ -389,6 +417,17 @@ func loadFormatErasure(disk StorageAPI) (format *formatErasureV3, err error) {
 		// 'file not found' and 'volume not found' as
 		// same. 'volume not found' usually means its a fresh disk.
 		if err == errFileNotFound || err == errVolumeNotFound {
+			var vols []VolInfo
+			vols, err = disk.ListVols(context.TODO())
+			if err != nil {
+				return nil, err
+			}
+			if !isHiddenDirectories(vols...) {
+				// 'format.json' not found, but we found user data, reject such disks.
+				return nil, fmt.Errorf("some unexpected files '%v' found on %s: %w",
+					vols, disk, errCorruptedFormat)
+			}
+			// No other data found, its a fresh disk.
 			return nil, errUnformattedDisk
 		}
 		return nil, err
@@ -504,6 +543,7 @@ func formatErasureFixDeploymentID(endpoints Endpoints, storageDisks []StorageAPI
 	// Deployment ID needs to be set on all the disks.
 	// Save `format.json` across all disks.
 	return saveFormatErasureAll(GlobalContext, storageDisks, formats)
+
 }
 
 // Update only the valid local disks which have not been updated before.
@@ -550,36 +590,43 @@ func formatErasureFixLocalDeploymentID(endpoints Endpoints, storageDisks []Stora
 
 // Get backend Erasure format in quorum `format.json`.
 func getFormatErasureInQuorum(formats []*formatErasureV3) (*formatErasureV3, error) {
-	formatCountMap := make(map[int]int, len(formats))
-	for _, format := range formats {
+	formatHashes := make([]string, len(formats))
+	for i, format := range formats {
 		if format == nil {
 			continue
 		}
-		formatCountMap[format.Drives()]++
+		h := sha256.New()
+		for _, set := range format.Erasure.Sets {
+			for _, diskID := range set {
+				h.Write([]byte(diskID))
+			}
+		}
+		formatHashes[i] = hex.EncodeToString(h.Sum(nil))
 	}
 
-	maxDrives := 0
+	formatCountMap := make(map[string]int)
+	for _, hash := range formatHashes {
+		if hash == "" {
+			continue
+		}
+		formatCountMap[hash]++
+	}
+
+	maxHash := ""
 	maxCount := 0
-	for drives, count := range formatCountMap {
+	for hash, count := range formatCountMap {
 		if count > maxCount {
 			maxCount = count
-			maxDrives = drives
+			maxHash = hash
 		}
-	}
-
-	if maxDrives == 0 {
-		return nil, errErasureReadQuorum
 	}
 
 	if maxCount < len(formats)/2 {
 		return nil, errErasureReadQuorum
 	}
 
-	for i, format := range formats {
-		if format == nil {
-			continue
-		}
-		if format.Drives() == maxDrives {
+	for i, hash := range formatHashes {
+		if hash == maxHash {
 			format := formats[i].Clone()
 			format.Erasure.This = ""
 			return format, nil
@@ -622,6 +669,58 @@ func formatErasureV3Check(reference *formatErasureV3, format *formatErasureV3) e
 	return fmt.Errorf("Disk ID %s not found in any disk sets %s", this, format.Erasure.Sets)
 }
 
+// Initializes meta volume only on local storage disks.
+func initErasureMetaVolumesInLocalDisks(storageDisks []StorageAPI, formats []*formatErasureV3) error {
+
+	// Compute the local disks eligible for meta volumes (re)initialization
+	var disksToInit []StorageAPI
+	for index := range storageDisks {
+		if formats[index] == nil || storageDisks[index] == nil || !storageDisks[index].IsLocal() {
+			// Ignore create meta volume on disks which are not found or not local.
+			continue
+		}
+		disksToInit = append(disksToInit, storageDisks[index])
+	}
+
+	// Initialize errs to collect errors inside go-routine.
+	g := errgroup.WithNErrs(len(disksToInit))
+
+	// Initialize all disks in parallel.
+	for index := range disksToInit {
+		// Initialize a new index variable in each loop so each
+		// goroutine will return its own instance of index variable.
+		index := index
+		g.Go(func() error {
+			return makeFormatErasureMetaVolumes(disksToInit[index])
+		}, index)
+	}
+
+	// Return upon first error.
+	for _, err := range g.Wait() {
+		if err == nil {
+			continue
+		}
+		return toObjectErr(err, minioMetaBucket)
+	}
+
+	// Return success here.
+	return nil
+}
+
+// saveUnformattedFormat - populates `format.json` on unformatted disks.
+// also adds `.healing.bin` on the disks which are being actively healed.
+func saveUnformattedFormat(ctx context.Context, storageDisks []StorageAPI, formats []*formatErasureV3) error {
+	for index, format := range formats {
+		if format == nil {
+			continue
+		}
+		if err := saveFormatErasure(storageDisks[index], format, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // saveFormatErasureAll - populates `format.json` on disks in its order.
 func saveFormatErasureAll(ctx context.Context, storageDisks []StorageAPI, formats []*formatErasureV3) error {
 	g := errgroup.WithNErrs(len(storageDisks))
@@ -644,18 +743,12 @@ func saveFormatErasureAll(ctx context.Context, storageDisks []StorageAPI, format
 
 // relinquishes the underlying connection for all storage disks.
 func closeStorageDisks(storageDisks []StorageAPI) {
-	var wg sync.WaitGroup
 	for _, disk := range storageDisks {
 		if disk == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(disk StorageAPI) {
-			defer wg.Done()
-			disk.Close()
-		}(disk)
+		disk.Close()
 	}
-	wg.Wait()
 }
 
 func initStorageDisksWithErrorsWithoutHealthCheck(endpoints Endpoints) ([]StorageAPI, []error) {
@@ -741,6 +834,7 @@ func fixFormatErasureV3(storageDisks []StorageAPI, endpoints Endpoints, formats 
 		}
 	}
 	return nil
+
 }
 
 // initFormatErasure - save Erasure format configuration on all disks.
@@ -828,14 +922,8 @@ func makeFormatErasureMetaVolumes(disk StorageAPI) error {
 	if disk == nil {
 		return errDiskNotFound
 	}
-	volumes := []string{
-		minioMetaTmpDeletedBucket, // creates .minio.sys/tmp as well as .minio.sys/tmp/.trash
-		minioMetaMultipartBucket,  // creates .minio.sys/multipart
-		dataUsageBucket,           // creates .minio.sys/buckets
-		minioConfigBucket,         // creates .minio.sys/config
-	}
 	// Attempt to create MinIO internal buckets.
-	return disk.MakeVolBulk(context.TODO(), volumes...)
+	return disk.MakeVolBulk(context.TODO(), minioMetaBucket, minioMetaTmpBucket, minioMetaMultipartBucket, dataUsageBucket)
 }
 
 // Initialize a new set of set formats which will be written to all disks.

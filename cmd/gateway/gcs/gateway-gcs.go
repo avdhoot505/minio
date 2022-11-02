@@ -1,11 +1,11 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2017-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,24 +29,27 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"regexp"
 	"strconv"
+
+	"regexp"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/cli"
-	"github.com/minio/madmin-go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
-	minio "github.com/minio/minio/cmd"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
-	"github.com/minio/pkg/bucket/policy/condition"
-	"github.com/minio/pkg/env"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/policy/condition"
+	"github.com/minio/minio/pkg/env"
+
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	minio "github.com/minio/minio/cmd"
 )
 
 var (
@@ -163,7 +166,7 @@ func (g *GCS) Name() string {
 }
 
 // NewGatewayLayer returns gcs ObjectLayer.
-func (g *GCS) NewGatewayLayer(creds madmin.Credentials) (minio.ObjectLayer, error) {
+func (g *GCS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
 	ctx := minio.GlobalContext
 
 	var err error
@@ -203,6 +206,11 @@ func (g *GCS) NewGatewayLayer(creds madmin.Credentials) (minio.ObjectLayer, erro
 	// Start background process to cleanup old files in minio.sys.tmp
 	go gcs.CleanupGCSMinioSysTmp(ctx)
 	return gcs, nil
+}
+
+// Production - GCS gateway is production ready.
+func (g *GCS) Production() bool {
+	return true
 }
 
 // Stored in gcs.json - Contents of this file is not used anywhere. It can be
@@ -405,7 +413,7 @@ func (l *gcsGateway) Shutdown(ctx context.Context) error {
 
 // StorageInfo - Not relevant to GCS backend.
 func (l *gcsGateway) StorageInfo(ctx context.Context) (si minio.StorageInfo, _ []error) {
-	si.Backend.Type = madmin.Gateway
+	si.Backend.Type = minio.BackendGateway
 	si.Backend.GatewayOnline = minio.IsBackendOnline(ctx, "storage.googleapis.com:443")
 	return si, nil
 }
@@ -470,7 +478,7 @@ func (l *gcsGateway) ListBuckets(ctx context.Context) (buckets []minio.BucketInf
 }
 
 // DeleteBucket delete a bucket on GCS.
-func (l *gcsGateway) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
+func (l *gcsGateway) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
 	itObject := l.client.Bucket(bucket).Objects(ctx, &storage.Query{
 		Delimiter: minio.SlashSeparator,
 		Versions:  false,
@@ -531,7 +539,7 @@ func toGCSPageToken(name string) string {
 		byte(length & 0xFF),
 	}
 
-	length >>= 7
+	length = length >> 7
 	if length > 0 {
 		b = append(b, byte(length&0xFF))
 	}
@@ -743,7 +751,7 @@ func (l *gcsGateway) GetObjectNInfo(ctx context.Context, bucket, object string, 
 
 	pr, pw := io.Pipe()
 	go func() {
-		err := l.getObject(ctx, bucket, object, startOffset, length, pw, objInfo.ETag, opts)
+		err := l.GetObject(ctx, bucket, object, startOffset, length, pw, objInfo.ETag, opts)
 		pw.CloseWithError(err)
 	}()
 	// Setup cleanup function to cause the above go-routine to
@@ -758,7 +766,7 @@ func (l *gcsGateway) GetObjectNInfo(ctx context.Context, bucket, object string, 
 //
 // startOffset indicates the starting read location of the object.
 // length indicates the total length of the object.
-func (l *gcsGateway) getObject(ctx context.Context, bucket string, key string, startOffset int64, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
+func (l *gcsGateway) GetObject(ctx context.Context, bucket string, key string, startOffset int64, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
 	// if we want to mimic S3 behavior exactly, we need to verify if bucket exists first,
 	// otherwise gcs will just return object not exist in case of non-existing bucket
 	if _, err := l.client.Bucket(bucket).Attrs(ctx); err != nil {
@@ -929,8 +937,7 @@ func (l *gcsGateway) PutObject(ctx context.Context, bucket string, key string, r
 
 // CopyObject - Copies a blob from source container to destination container.
 func (l *gcsGateway) CopyObject(ctx context.Context, srcBucket string, srcObject string, destBucket string, destObject string,
-	srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions,
-) (minio.ObjectInfo, error) {
+	srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.ObjectInfo, error) {
 	if srcOpts.CheckPrecondFn != nil && srcOpts.CheckPrecondFn(srcInfo) {
 		return minio.ObjectInfo{}, minio.PreConditionFailed{}
 	}
@@ -1122,6 +1129,7 @@ func (l *gcsGateway) PutObjectPart(ctx context.Context, bucket string, key strin
 		LastModified: minio.UTCNow(),
 		Size:         data.Size(),
 	}, nil
+
 }
 
 // gcsGetPartInfo returns PartInfo of a given object part
@@ -1471,7 +1479,6 @@ func (l *gcsGateway) GetBucketPolicy(ctx context.Context, bucket string) (*polic
 		Version: policy.DefaultVersion,
 		Statements: []policy.Statement{
 			policy.NewStatement(
-				"",
 				policy.Allow,
 				policy.NewPrincipal("*"),
 				actionSet,

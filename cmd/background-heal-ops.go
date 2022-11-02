@@ -1,27 +1,27 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
-	"runtime"
+	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 // healTask represents what to heal along with options
@@ -34,7 +34,7 @@ type healTask struct {
 	versionID string
 	opts      madmin.HealOpts
 	// Healing response will be sent here
-	respCh chan healResult
+	responseCh chan healResult
 }
 
 // healResult represents a healing result with a possible error
@@ -45,37 +45,54 @@ type healResult struct {
 
 // healRoutine receives heal tasks, to heal buckets, objects and format.json
 type healRoutine struct {
-	tasks   chan healTask
-	workers int
+	tasks  chan healTask
+	doneCh chan struct{}
 }
 
-func systemIO() int {
+// Add a new task in the tasks queue
+func (h *healRoutine) queueHealTask(task healTask) {
+	h.tasks <- task
+}
+
+func waitForLowHTTPReq(maxIO int, maxWait time.Duration) {
+	// No need to wait run at full speed.
+	if maxIO <= 0 {
+		return
+	}
+
+	// At max 10 attempts to wait with 100 millisecond interval before proceeding
+	waitTick := 100 * time.Millisecond
+
 	// Bucket notification and http trace are not costly, it is okay to ignore them
 	// while counting the number of concurrent connections
-	return int(globalHTTPListen.NumSubscribers()) + int(globalTrace.NumSubscribers())
-}
+	maxIOFn := func() int {
+		return maxIO + int(globalHTTPListen.NumSubscribers()) + int(globalHTTPTrace.NumSubscribers())
+	}
 
-func waitForLowHTTPReq() {
-	var currentIO func() int
+	tmpMaxWait := maxWait
 	if httpServer := newHTTPServerFn(); httpServer != nil {
-		currentIO = httpServer.GetRequestCount
+		// Any requests in progress, delay the heal.
+		for httpServer.GetRequestCount() >= maxIOFn() {
+			if tmpMaxWait > 0 {
+				if tmpMaxWait < waitTick {
+					time.Sleep(tmpMaxWait)
+				} else {
+					time.Sleep(waitTick)
+				}
+				tmpMaxWait = tmpMaxWait - waitTick
+			}
+			if tmpMaxWait <= 0 {
+				if intDataUpdateTracker.debug {
+					logger.Info("waitForLowHTTPReq: waited max %s, resuming", maxWait)
+				}
+				break
+			}
+		}
 	}
-
-	globalHealConfig.Wait(currentIO, systemIO)
-}
-
-func initBackgroundHealing(ctx context.Context, objAPI ObjectLayer) {
-	// Run the background healer
-	globalBackgroundHealRoutine = newHealRoutine()
-	for i := 0; i < globalBackgroundHealRoutine.workers; i++ {
-		go globalBackgroundHealRoutine.AddWorker(ctx, objAPI)
-	}
-
-	globalBackgroundHealState.LaunchNewHealSequence(newBgHealSequence(), objAPI)
 }
 
 // Wait for heal requests and process them
-func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
+func (h *healRoutine) run(ctx context.Context, objAPI ObjectLayer) {
 	for {
 		select {
 		case task, ok := <-h.tasks:
@@ -87,7 +104,6 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 			var err error
 			switch task.bucket {
 			case nopHeal:
-				task.respCh <- healResult{err: errSkipFile}
 				continue
 			case SlashSeparator:
 				res, err = healDiskFormat(ctx, objAPI, task.opts)
@@ -98,8 +114,10 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 					res, err = objAPI.HealObject(ctx, task.bucket, task.object, task.versionID, task.opts)
 				}
 			}
+			task.responseCh <- healResult{result: res, err: err}
 
-			task.respCh <- healResult{result: res, err: err}
+		case <-h.doneCh:
+			return
 		case <-ctx.Done():
 			return
 		}
@@ -107,14 +125,11 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 }
 
 func newHealRoutine() *healRoutine {
-	workers := runtime.GOMAXPROCS(0) / 2
-	if workers == 0 {
-		workers = 4
-	}
 	return &healRoutine{
-		tasks:   make(chan healTask),
-		workers: workers,
+		tasks:  make(chan healTask),
+		doneCh: make(chan struct{}),
 	}
+
 }
 
 // healDiskFormat - heals format.json, return value indicates if a

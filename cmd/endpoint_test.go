@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2017,2018,2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -25,6 +24,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/minio/minio-go/v7/pkg/set"
 )
 
 func TestNewEndpoint(t *testing.T) {
@@ -128,12 +129,6 @@ func TestNewEndpoints(t *testing.T) {
 }
 
 func TestCreateEndpoints(t *testing.T) {
-	tempGlobalMinioPort := globalMinioPort
-	defer func() {
-		globalMinioPort = tempGlobalMinioPort
-	}()
-	globalMinioPort = "9000"
-
 	// Filter ipList by IPs those do not start with '127.'.
 	nonLoopBackIPs := localIP4.FuncMatch(func(ip string, matchString string) bool {
 		return !net.ParseIP(ip).IsLoopback()
@@ -238,18 +233,13 @@ func TestCreateEndpoints(t *testing.T) {
 		{"localhost:9000", [][]string{{"https://127.0.0.1:9000/d1", "https://localhost:9001/d1", "https://example.com/d1", "https://example.com/d2"}}, "", Endpoints{}, -1, fmt.Errorf("path '/d1' can not be served by different port on same address")},
 
 		// Erasure Setup with PathEndpointType
-		{
-			":1234",
-			[][]string{{"/d1", "/d2", "/d3", "/d4"}},
-			":1234",
+		{":1234", [][]string{{"/d1", "/d2", "/d3", "/d4"}}, ":1234",
 			Endpoints{
 				Endpoint{URL: &url.URL{Path: mustAbs("/d1")}, IsLocal: true},
 				Endpoint{URL: &url.URL{Path: mustAbs("/d2")}, IsLocal: true},
 				Endpoint{URL: &url.URL{Path: mustAbs("/d3")}, IsLocal: true},
 				Endpoint{URL: &url.URL{Path: mustAbs("/d4")}, IsLocal: true},
-			},
-			ErasureSetupType, nil,
-		},
+			}, ErasureSetupType, nil},
 		// DistErasure Setup with URLEndpointType
 		{":9000", [][]string{{"http://localhost/d1", "http://localhost/d2", "http://localhost/d3", "http://localhost/d4"}}, ":9000", Endpoints{
 			Endpoint{URL: &url.URL{Scheme: "http", Host: "localhost", Path: "/d1"}, IsLocal: true},
@@ -344,10 +334,13 @@ func TestCreateEndpoints(t *testing.T) {
 // So it means that if you have say localhost:9000 and localhost:9001 as endpointArgs then localhost:9001
 // is considered a remote service from localhost:9000 perspective.
 func TestGetLocalPeer(t *testing.T) {
+	tempGlobalMinioAddr := globalMinioAddr
 	tempGlobalMinioPort := globalMinioPort
 	defer func() {
+		globalMinioAddr = tempGlobalMinioAddr
 		globalMinioPort = tempGlobalMinioPort
 	}()
+	globalMinioAddr = ":9000"
 	globalMinioPort = "9000"
 
 	testCases := []struct {
@@ -355,18 +348,12 @@ func TestGetLocalPeer(t *testing.T) {
 		expectedResult string
 	}{
 		{[]string{"/d1", "/d2", "d3", "d4"}, "127.0.0.1:9000"},
-		{
-			[]string{"http://localhost:9000/d1", "http://localhost:9000/d2", "http://example.org:9000/d3", "http://example.com:9000/d4"},
-			"localhost:9000",
-		},
-		{
-			[]string{"http://localhost:9000/d1", "http://example.org:9000/d2", "http://example.com:9000/d3", "http://example.net:9000/d4"},
-			"localhost:9000",
-		},
-		{
-			[]string{"http://localhost:9000/d1", "http://localhost:9001/d2", "http://localhost:9002/d3", "http://localhost:9003/d4"},
-			"localhost:9000",
-		},
+		{[]string{"http://localhost:9000/d1", "http://localhost:9000/d2", "http://example.org:9000/d3", "http://example.com:9000/d4"},
+			"localhost:9000"},
+		{[]string{"http://localhost:9000/d1", "http://example.org:9000/d2", "http://example.com:9000/d3", "http://example.net:9000/d4"},
+			"localhost:9000"},
+		{[]string{"http://localhost:9000/d1", "http://localhost:9001/d2", "http://localhost:9002/d3", "http://localhost:9003/d4"},
+			"localhost:9000"},
 	}
 
 	for i, testCase := range testCases {
@@ -376,9 +363,9 @@ func TestGetLocalPeer(t *testing.T) {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
 			}
 		}
-		localPeer := GetLocalPeer(zendpoints, "", "9000")
-		if localPeer != testCase.expectedResult {
-			t.Fatalf("Test %d: expected: %v, got: %v", i+1, testCase.expectedResult, localPeer)
+		remotePeer := GetLocalPeer(zendpoints)
+		if remotePeer != testCase.expectedResult {
+			t.Fatalf("Test %d: expected: %v, got: %v", i+1, testCase.expectedResult, remotePeer)
 		}
 	}
 }
@@ -415,6 +402,46 @@ func TestGetRemotePeers(t *testing.T) {
 		}
 		if local != testCase.expectedLocal {
 			t.Errorf("expected: %v, got: %v", testCase.expectedLocal, local)
+		}
+	}
+}
+
+func TestUpdateDomainIPs(t *testing.T) {
+	tempGlobalMinioPort := globalMinioPort
+	defer func() {
+		globalMinioPort = tempGlobalMinioPort
+	}()
+	globalMinioPort = "9000"
+
+	tempGlobalDomainIPs := globalDomainIPs
+	defer func() {
+		globalDomainIPs = tempGlobalDomainIPs
+	}()
+
+	ipv4TestCases := []struct {
+		endPoints      set.StringSet
+		expectedResult set.StringSet
+	}{
+		{set.NewStringSet(), set.NewStringSet()},
+		{set.CreateStringSet("localhost"), set.NewStringSet()},
+		{set.CreateStringSet("localhost", "10.0.0.1"), set.CreateStringSet("10.0.0.1:9000")},
+		{set.CreateStringSet("localhost:9001", "10.0.0.1"), set.CreateStringSet("10.0.0.1:9000")},
+		{set.CreateStringSet("localhost", "10.0.0.1:9001"), set.CreateStringSet("10.0.0.1:9001")},
+		{set.CreateStringSet("localhost:9000", "10.0.0.1:9001"), set.CreateStringSet("10.0.0.1:9001")},
+
+		{set.CreateStringSet("10.0.0.1", "10.0.0.2"), set.CreateStringSet("10.0.0.1:9000", "10.0.0.2:9000")},
+		{set.CreateStringSet("10.0.0.1:9001", "10.0.0.2"), set.CreateStringSet("10.0.0.1:9001", "10.0.0.2:9000")},
+		{set.CreateStringSet("10.0.0.1", "10.0.0.2:9002"), set.CreateStringSet("10.0.0.1:9000", "10.0.0.2:9002")},
+		{set.CreateStringSet("10.0.0.1:9001", "10.0.0.2:9002"), set.CreateStringSet("10.0.0.1:9001", "10.0.0.2:9002")},
+	}
+
+	for _, testCase := range ipv4TestCases {
+		globalDomainIPs = nil
+
+		updateDomainIPs(testCase.endPoints)
+
+		if !testCase.expectedResult.Equals(globalDomainIPs) {
+			t.Fatalf("error: expected = %s, got = %s", testCase.expectedResult, globalDomainIPs)
 		}
 	}
 }

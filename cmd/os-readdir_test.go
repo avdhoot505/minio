@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -36,7 +35,7 @@ func TestReadDirFail(t *testing.T) {
 	}
 
 	file := path.Join(os.TempDir(), "issue")
-	if err := ioutil.WriteFile(file, []byte(""), 0o644); err != nil {
+	if err := ioutil.WriteFile(file, []byte(""), 0644); err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(file)
@@ -49,7 +48,7 @@ func TestReadDirFail(t *testing.T) {
 	// Only valid for linux.
 	if runtime.GOOS == "linux" {
 		permDir := path.Join(os.TempDir(), "perm-dir")
-		if err := os.MkdirAll(permDir, os.FileMode(0o200)); err != nil {
+		if err := os.MkdirAll(permDir, os.FileMode(0200)); err != nil {
 			t.Fatal(err)
 		}
 		defer os.RemoveAll(permDir)
@@ -108,7 +107,7 @@ func setupTestReadDirFiles(t *testing.T) (testResults []result) {
 // Test to read non-empty directory with directories and files.
 func setupTestReadDirGeneric(t *testing.T) (testResults []result) {
 	dir := mustSetupDir(t)
-	if err := os.MkdirAll(filepath.Join(dir, "mydir"), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "mydir"), 0777); err != nil {
 		t.Fatalf("Unable to create prefix directory \"mydir\", %s", err)
 	}
 	entries := []string{"mydir/"}
@@ -150,10 +149,9 @@ func setupTestReadDirSymlink(t *testing.T) (testResults []result) {
 		}
 		// Add to entries.
 		entries = append(entries, name1)
-		// Symlinks are preserved for regular files
-		entries = append(entries, name2)
+		// Symlinks are ignored.
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "mydir"), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "mydir"), 0777); err != nil {
 		t.Fatalf("Unable to create \"mydir\", %s", err)
 	}
 	entries = append(entries, "mydir/")

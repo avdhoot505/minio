@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -22,14 +21,13 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"runtime"
 	"sort"
 	"strings"
 
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/internal/config"
-	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/logger"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
 // IPv4 addresses of local host.
@@ -47,30 +45,20 @@ func mustSplitHostPort(hostPort string) (host, port string) {
 // mustGetLocalIP4 returns IPv4 addresses of localhost.  It panics on error.
 func mustGetLocalIP4() (ipList set.StringSet) {
 	ipList = set.NewStringSet()
-	ifs, err := net.Interfaces()
+	addrs, err := net.InterfaceAddrs()
 	logger.FatalIf(err, "Unable to get IP addresses of this host")
 
-	for _, interf := range ifs {
-		addrs, err := interf.Addrs()
-		if err != nil {
-			continue
-		}
-		if runtime.GOOS == "windows" && interf.Flags&net.FlagUp == 0 {
-			continue
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
 		}
 
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-
-			if ip.To4() != nil {
-				ipList.Add(ip.String())
-			}
+		if ip.To4() != nil {
+			ipList.Add(ip.String())
 		}
 	}
 
@@ -102,14 +90,15 @@ func mustGetLocalIP6() (ipList set.StringSet) {
 
 // getHostIP returns IP address of given host.
 func getHostIP(host string) (ipList set.StringSet, err error) {
-	addrs, err := globalDNSCache.LookupHost(GlobalContext, host)
-	if err != nil {
+	var ips []net.IP
+
+	if ips, err = net.LookupIP(host); err != nil {
 		return ipList, err
 	}
 
 	ipList = set.NewStringSet()
-	for _, addr := range addrs {
-		ipList.Add(addr)
+	for _, ip := range ips {
+		ipList.Add(ip.String())
 	}
 
 	return ipList, err
@@ -166,30 +155,7 @@ func sortIPs(ipList []string) []string {
 	return append(nonIPs, ips...)
 }
 
-func getConsoleEndpoints() (consoleEndpoints []string) {
-	if globalBrowserRedirectURL != nil {
-		return []string{globalBrowserRedirectURL.String()}
-	}
-	var ipList []string
-	if globalMinioConsoleHost == "" {
-		ipList = sortIPs(mustGetLocalIP4().ToSlice())
-		ipList = append(ipList, mustGetLocalIP6().ToSlice()...)
-	} else {
-		ipList = []string{globalMinioConsoleHost}
-	}
-
-	for _, ip := range ipList {
-		endpoint := fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(ip, globalMinioConsolePort))
-		consoleEndpoints = append(consoleEndpoints, endpoint)
-	}
-
-	return consoleEndpoints
-}
-
 func getAPIEndpoints() (apiEndpoints []string) {
-	if globalMinioEndpoint != "" {
-		return []string{globalMinioEndpoint}
-	}
 	var ipList []string
 	if globalMinioHost == "" {
 		ipList = sortIPs(mustGetLocalIP4().ToSlice())
@@ -324,6 +290,7 @@ func isLocalHost(host string, port string, localPort string) (bool, error) {
 // formats, point to the same machine, e.g:
 //  ':9000' and 'http://localhost:9000/' will return true
 func sameLocalAddrs(addr1, addr2 string) (bool, error) {
+
 	// Extract host & port from given parameters
 	host1, port1, err := extractHostPort(addr1)
 	if err != nil {
@@ -339,17 +306,21 @@ func sameLocalAddrs(addr1, addr2 string) (bool, error) {
 	if host1 == "" {
 		// If empty host means it is localhost
 		addr1Local = true
-	} else if addr1Local, err = isLocalHost(host1, port1, port1); err != nil {
+	} else {
 		// Host not empty, check if it is local
-		return false, err
+		if addr1Local, err = isLocalHost(host1, port1, port1); err != nil {
+			return false, err
+		}
 	}
 
 	if host2 == "" {
 		// If empty host means it is localhost
 		addr2Local = true
-	} else if addr2Local, err = isLocalHost(host2, port2, port2); err != nil {
+	} else {
 		// Host not empty, check if it is local
-		return false, err
+		if addr2Local, err = isLocalHost(host2, port2, port2); err != nil {
+			return false, err
+		}
 	}
 
 	// If both of addresses point to the same machine, check if

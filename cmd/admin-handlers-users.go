@@ -1,38 +1,58 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2019-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"path"
 	"sort"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/auth"
-	"github.com/minio/minio/internal/config/dns"
-	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/minio/cmd/config/dns"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
+	iampolicy "github.com/minio/minio/pkg/iam/policy"
+	"github.com/minio/minio/pkg/madmin"
 )
+
+func validateAdminUsersReq(ctx context.Context, w http.ResponseWriter, r *http.Request, action iampolicy.AdminAction) (ObjectLayer, auth.Credentials) {
+	var cred auth.Credentials
+	var adminAPIErr APIErrorCode
+
+	// Get current object layer instance.
+	objectAPI := newObjectLayerFn()
+	if objectAPI == nil || globalNotificationSys == nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+		return nil, cred
+	}
+
+	// Validate request signature.
+	cred, adminAPIErr = checkAdminRequestAuth(ctx, r, action, "")
+	if adminAPIErr != ErrNone {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
+		return nil, cred
+	}
+
+	return objectAPI, cred
+}
 
 // RemoveUser - DELETE /minio/admin/v3/remove-user?accessKey=<access_key>
 func (a adminAPIHandlers) RemoveUser(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +60,7 @@ func (a adminAPIHandlers) RemoveUser(w http.ResponseWriter, r *http.Request) {
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DeleteUserAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.DeleteUserAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -48,7 +68,7 @@ func (a adminAPIHandlers) RemoveUser(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	accessKey := vars["accessKey"]
 
-	ok, _, err := globalIAMSys.IsTempUser(accessKey)
+	ok, err := globalIAMSys.IsTempUser(accessKey)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -58,57 +78,18 @@ func (a adminAPIHandlers) RemoveUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := globalIAMSys.DeleteUser(ctx, accessKey, true); err != nil {
+	if err := globalIAMSys.DeleteUser(accessKey); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type: madmin.SRIAMItemIAMUser,
-		IAMUser: &madmin.SRIAMUser{
-			AccessKey:   accessKey,
-			IsDeleteReq: true,
-		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other MinIO peers to delete user.
+	for _, nerr := range globalNotificationSys.DeleteUser(accessKey) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
-}
-
-// ListBucketUsers - GET /minio/admin/v3/list-users?bucket={bucket}
-func (a adminAPIHandlers) ListBucketUsers(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListBucketUsers")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ListUsersAdminAction)
-	if objectAPI == nil {
-		return
-	}
-
-	bucket := mux.Vars(r)["bucket"]
-
-	password := cred.SecretKey
-
-	allCredentials, err := globalIAMSys.ListBucketUsers(bucket)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	data, err := json.Marshal(allCredentials)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	econfigData, err := madmin.EncryptData(password, data)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	writeSuccessResponseJSON(w, econfigData)
 }
 
 // ListUsers - GET /minio/admin/v3/list-users
@@ -117,7 +98,7 @@ func (a adminAPIHandlers) ListUsers(w http.ResponseWriter, r *http.Request) {
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ListUsersAdminAction)
+	objectAPI, cred := validateAdminUsersReq(ctx, w, r, iampolicy.ListUsersAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -130,18 +111,6 @@ func (a adminAPIHandlers) ListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add ldap users which have mapped policies if in LDAP mode
-	// FIXME(vadmeste): move this to policy info in the future
-	ldapUsers, err := globalIAMSys.ListLDAPUsers()
-	if err != nil && err != errIAMActionNotAllowed {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-	for k, v := range ldapUsers {
-		allCredentials[k] = v
-	}
-
-	// Marshal the response
 	data, err := json.Marshal(allCredentials)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
@@ -179,27 +148,26 @@ func (a adminAPIHandlers) GetUserInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	checkDenyOnly := false
-	if name == cred.AccessKey {
-		// Check that there is no explicit deny - otherwise it's allowed
-		// to view one's own info.
-		checkDenyOnly = true
+	accessKey := cred.AccessKey
+	if cred.ParentUser != "" {
+		accessKey = cred.ParentUser
 	}
 
-	if !globalIAMSys.IsAllowed(iampolicy.Args{
-		AccountName:     cred.AccessKey,
-		Groups:          cred.Groups,
-		Action:          iampolicy.GetUserAdminAction,
-		ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-		IsOwner:         owner,
-		Claims:          claims,
-		DenyOnly:        checkDenyOnly,
-	}) {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-		return
+	implicitPerm := name == accessKey
+	if !implicitPerm {
+		if !globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     accessKey,
+			Action:          iampolicy.GetUserAdminAction,
+			ConditionValues: getConditionValues(r, "", accessKey, claims),
+			IsOwner:         owner,
+			Claims:          claims,
+		}) {
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+			return
+		}
 	}
 
-	userInfo, err := globalIAMSys.GetUserInfo(ctx, name)
+	userInfo, err := globalIAMSys.GetUserInfo(name)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -220,11 +188,12 @@ func (a adminAPIHandlers) UpdateGroupMembers(w http.ResponseWriter, r *http.Requ
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.AddUserToGroupAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.AddUserToGroupAdminAction)
 	if objectAPI == nil {
 		return
 	}
 
+	defer r.Body.Close()
 	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
@@ -239,23 +208,22 @@ func (a adminAPIHandlers) UpdateGroupMembers(w http.ResponseWriter, r *http.Requ
 	}
 
 	if updReq.IsRemove {
-		err = globalIAMSys.RemoveUsersFromGroup(ctx, updReq.Group, updReq.Members)
+		err = globalIAMSys.RemoveUsersFromGroup(updReq.Group, updReq.Members)
 	} else {
-		err = globalIAMSys.AddUsersToGroup(ctx, updReq.Group, updReq.Members)
+		err = globalIAMSys.AddUsersToGroup(updReq.Group, updReq.Members)
 	}
+
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type: madmin.SRIAMItemGroupInfo,
-		GroupInfo: &madmin.SRGroupInfo{
-			UpdateReq: updReq,
-		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other MinIO peers to load group.
+	for _, nerr := range globalNotificationSys.LoadGroup(updReq.Group) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
 }
 
@@ -265,7 +233,7 @@ func (a adminAPIHandlers) GetGroup(w http.ResponseWriter, r *http.Request) {
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.GetGroupAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.GetGroupAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -294,12 +262,12 @@ func (a adminAPIHandlers) ListGroups(w http.ResponseWriter, r *http.Request) {
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ListGroupsAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.ListGroupsAdminAction)
 	if objectAPI == nil {
 		return
 	}
 
-	groups, err := globalIAMSys.ListGroups(ctx)
+	groups, err := globalIAMSys.ListGroups()
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -320,7 +288,7 @@ func (a adminAPIHandlers) SetGroupStatus(w http.ResponseWriter, r *http.Request)
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.EnableGroupAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.EnableGroupAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -330,12 +298,11 @@ func (a adminAPIHandlers) SetGroupStatus(w http.ResponseWriter, r *http.Request)
 	status := vars["status"]
 
 	var err error
-	switch status {
-	case statusEnabled:
-		err = globalIAMSys.SetGroupStatus(ctx, group, true)
-	case statusDisabled:
-		err = globalIAMSys.SetGroupStatus(ctx, group, false)
-	default:
+	if status == statusEnabled {
+		err = globalIAMSys.SetGroupStatus(group, true)
+	} else if status == statusDisabled {
+		err = globalIAMSys.SetGroupStatus(group, false)
+	} else {
 		err = errInvalidArgument
 	}
 	if err != nil {
@@ -343,18 +310,12 @@ func (a adminAPIHandlers) SetGroupStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type: madmin.SRIAMItemGroupInfo,
-		GroupInfo: &madmin.SRGroupInfo{
-			UpdateReq: madmin.GroupAddRemove{
-				Group:    group,
-				Status:   madmin.GroupStatus(status),
-				IsRemove: false,
-			},
-		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other MinIO peers to reload user.
+	for _, nerr := range globalNotificationSys.LoadGroup(group) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
 }
 
@@ -364,7 +325,7 @@ func (a adminAPIHandlers) SetUserStatus(w http.ResponseWriter, r *http.Request) 
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.EnableUserAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.EnableUserAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -373,29 +334,23 @@ func (a adminAPIHandlers) SetUserStatus(w http.ResponseWriter, r *http.Request) 
 	accessKey := vars["accessKey"]
 	status := vars["status"]
 
-	// This API is not allowed to lookup master access key user status
+	// This API is not allowed to lookup accessKey user status
 	if accessKey == globalActiveCred.AccessKey {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
 	}
 
-	if err := globalIAMSys.SetUserStatus(ctx, accessKey, madmin.AccountStatus(status)); err != nil {
+	if err := globalIAMSys.SetUserStatus(accessKey, madmin.AccountStatus(status)); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type: madmin.SRIAMItemIAMUser,
-		IAMUser: &madmin.SRIAMUser{
-			AccessKey:   accessKey,
-			IsDeleteReq: false,
-			UserReq: &madmin.AddOrUpdateUserReq{
-				Status: madmin.AccountStatus(status),
-			},
-		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other MinIO peers to reload user.
+	for _, nerr := range globalNotificationSys.LoadUser(accessKey, false) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
 }
 
@@ -406,7 +361,7 @@ func (a adminAPIHandlers) AddUser(w http.ResponseWriter, r *http.Request) {
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
-	accessKey := vars["accessKey"]
+	accessKey := path.Clean(vars["accessKey"])
 
 	// Get current object layer instance.
 	objectAPI := newObjectLayerFn()
@@ -427,14 +382,6 @@ func (a adminAPIHandlers) AddUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userCred, exists := globalIAMSys.GetUser(ctx, accessKey)
-	if exists && (userCred.IsTemp() || userCred.IsServiceAccount()) {
-		// Updating STS credential is not allowed, and this API does not
-		// support updating service accounts.
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAddUserInvalidArgument), r.URL)
-		return
-	}
-
 	if (cred.IsTemp() || cred.IsServiceAccount()) && cred.ParentUser == accessKey {
 		// Incoming access key matches parent user then we should
 		// reject password change requests.
@@ -442,24 +389,22 @@ func (a adminAPIHandlers) AddUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	checkDenyOnly := false
-	if accessKey == cred.AccessKey {
-		// Check that there is no explicit deny - otherwise it's allowed
-		// to change one's own password.
-		checkDenyOnly = true
-	}
-
-	if !globalIAMSys.IsAllowed(iampolicy.Args{
-		AccountName:     cred.AccessKey,
-		Groups:          cred.Groups,
-		Action:          iampolicy.CreateUserAdminAction,
-		ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-		IsOwner:         owner,
-		Claims:          claims,
-		DenyOnly:        checkDenyOnly,
-	}) {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-		return
+	implicitPerm := accessKey == cred.AccessKey
+	if !implicitPerm {
+		parentUser := cred.ParentUser
+		if parentUser == "" {
+			parentUser = cred.AccessKey
+		}
+		if !globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     parentUser,
+			Action:          iampolicy.CreateUserAdminAction,
+			ConditionValues: getConditionValues(r, "", parentUser, claims),
+			IsOwner:         owner,
+			Claims:          claims,
+		}) {
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+			return
+		}
 	}
 
 	if r.ContentLength > maxEConfigJSONSize || r.ContentLength == -1 {
@@ -476,28 +421,24 @@ func (a adminAPIHandlers) AddUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var ureq madmin.AddOrUpdateUserReq
-	if err = json.Unmarshal(configBytes, &ureq); err != nil {
+	var uinfo madmin.UserInfo
+	if err = json.Unmarshal(configBytes, &uinfo); err != nil {
 		logger.LogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), r.URL)
 		return
 	}
 
-	if err = globalIAMSys.CreateUser(ctx, accessKey, ureq); err != nil {
+	if err = globalIAMSys.CreateUser(accessKey, uinfo); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type: madmin.SRIAMItemIAMUser,
-		IAMUser: &madmin.SRIAMUser{
-			AccessKey:   accessKey,
-			IsDeleteReq: false,
-			UserReq:     &ureq,
-		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other Minio peers to reload user
+	for _, nerr := range globalNotificationSys.LoadUser(accessKey, false) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
 }
 
@@ -514,9 +455,15 @@ func (a adminAPIHandlers) AddServiceAccount(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	cred, claims, owner, s3Err := validateAdminSignature(ctx, r, "")
+	cred, _, owner, s3Err := validateAdminSignature(ctx, r, "")
 	if s3Err != ErrNone {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+		return
+	}
+
+	// Disallow creating service accounts by root user.
+	if owner {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminAccountNotEligible), r.URL)
 		return
 	}
 
@@ -533,154 +480,27 @@ func (a adminAPIHandlers) AddServiceAccount(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	var (
-		targetUser   string
-		targetGroups []string
-	)
-
-	// If the request did not set a TargetUser, the service account is
-	// created for the request sender.
-	targetUser = createReq.TargetUser
-	if targetUser == "" {
-		targetUser = cred.AccessKey
+	parentUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		parentUser = cred.ParentUser
 	}
 
-	opts := newServiceAccountOpts{
-		accessKey: createReq.AccessKey,
-		secretKey: createReq.SecretKey,
-		claims:    make(map[string]interface{}),
-	}
-
-	// Find the user for the request sender (as it may be sent via a service
-	// account or STS account):
-	requestorUser := cred.AccessKey
-	requestorParentUser := cred.AccessKey
-	requestorGroups := cred.Groups
-	requestorIsDerivedCredential := false
-	if cred.IsServiceAccount() || cred.IsTemp() {
-		requestorParentUser = cred.ParentUser
-		requestorIsDerivedCredential = true
-	}
-
-	// Check if we are creating svc account for request sender.
-	isSvcAccForRequestor := false
-	if targetUser == requestorUser || targetUser == requestorParentUser {
-		isSvcAccForRequestor = true
-	}
-
-	// If we are creating svc account for request sender, ensure
-	// that targetUser is a real user (i.e. not derived
-	// credentials).
-	if isSvcAccForRequestor {
-		// Check if adding service account is explicitly denied.
-		//
-		// This allows turning off service accounts for request sender,
-		// if there is no deny statement this call is implicitly enabled.
-		if !globalIAMSys.IsAllowed(iampolicy.Args{
-			AccountName:     requestorUser,
-			Groups:          requestorGroups,
-			Action:          iampolicy.CreateServiceAccountAdminAction,
-			ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-			IsOwner:         owner,
-			Claims:          claims,
-			DenyOnly:        true,
-		}) {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
-
-		if requestorIsDerivedCredential {
-			if requestorParentUser == "" {
-				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx,
-					errors.New("service accounts cannot be generated for temporary credentials without parent")), r.URL)
-				return
-			}
-			targetUser = requestorParentUser
-		}
-		targetGroups = requestorGroups
-
-		// In case of LDAP/OIDC we need to set `opts.claims` to ensure
-		// it is associated with the LDAP/OIDC user properly.
-		for k, v := range cred.Claims {
-			if k == expClaim {
-				continue
-			}
-			opts.claims[k] = v
-		}
-	} else {
-		// Need permission if we are creating a service acccount for a
-		// user <> to the request sender
-		if !globalIAMSys.IsAllowed(iampolicy.Args{
-			AccountName:     requestorUser,
-			Groups:          requestorGroups,
-			Action:          iampolicy.CreateServiceAccountAdminAction,
-			ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-			IsOwner:         owner,
-			Claims:          claims,
-		}) {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
-
-		// In case of LDAP we need to resolve the targetUser to a DN and
-		// query their groups:
-		if globalLDAPConfig.Enabled {
-			opts.claims[ldapUserN] = targetUser // simple username
-			targetUser, targetGroups, err = globalLDAPConfig.LookupUserDN(targetUser)
-			if err != nil {
-				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-				return
-			}
-			opts.claims[ldapUser] = targetUser // username DN
-		}
-
-		// NOTE: if not using LDAP, then internal IDP or open ID is
-		// being used - in the former, group info is enforced when
-		// generated credentials are used to make requests, and in the
-		// latter, a group notion is not supported.
-	}
-
-	var sp *iampolicy.Policy
-	if len(createReq.Policy) > 0 {
-		sp, err = iampolicy.ParseConfig(bytes.NewReader(createReq.Policy))
-		if err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
-	}
-
-	opts.sessionPolicy = sp
-	newCred, err := globalIAMSys.NewServiceAccount(ctx, targetUser, targetGroups, opts)
+	newCred, err := globalIAMSys.NewServiceAccount(ctx, parentUser, createReq.Policy)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	// Call hook for cluster-replication if the service account is not for a
-	// root user.
-	if newCred.ParentUser != globalActiveCred.AccessKey {
-		err = globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-			Type: madmin.SRIAMItemSvcAcc,
-			SvcAccChange: &madmin.SRSvcAccChange{
-				Create: &madmin.SRSvcAccCreate{
-					Parent:        newCred.ParentUser,
-					AccessKey:     newCred.AccessKey,
-					SecretKey:     newCred.SecretKey,
-					Groups:        newCred.Groups,
-					Claims:        opts.claims,
-					SessionPolicy: createReq.Policy,
-					Status:        auth.AccountOn,
-				},
-			},
-		})
-		if err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
+	// Notify all other Minio peers to reload user the service account
+	for _, nerr := range globalNotificationSys.LoadServiceAccount(newCred.AccessKey) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
 		}
 	}
 
-	createResp := madmin.AddServiceAccountResp{
-		Credentials: madmin.Credentials{
+	var createResp = madmin.AddServiceAccountResp{
+		Credentials: auth.Credentials{
 			AccessKey: newCred.AccessKey,
 			SecretKey: newCred.SecretKey,
 		},
@@ -693,199 +513,6 @@ func (a adminAPIHandlers) AddServiceAccount(w http.ResponseWriter, r *http.Reque
 	}
 
 	encryptedData, err := madmin.EncryptData(password, data)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	writeSuccessResponseJSON(w, encryptedData)
-}
-
-// UpdateServiceAccount - POST /minio/admin/v3/update-service-account
-func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "UpdateServiceAccount")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	// Get current object layer instance.
-	objectAPI := newObjectLayerFn()
-	if objectAPI == nil || globalNotificationSys == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
-		return
-	}
-
-	cred, claims, owner, s3Err := validateAdminSignature(ctx, r, "")
-	if s3Err != ErrNone {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
-		return
-	}
-
-	accessKey := mux.Vars(r)["accessKey"]
-	if accessKey == "" {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
-		return
-	}
-
-	svcAccount, _, err := globalIAMSys.GetServiceAccount(ctx, accessKey)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	if !globalIAMSys.IsAllowed(iampolicy.Args{
-		AccountName:     cred.AccessKey,
-		Action:          iampolicy.UpdateServiceAccountAdminAction,
-		ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-		IsOwner:         owner,
-		Claims:          claims,
-	}) {
-		requestUser := cred.AccessKey
-		if cred.ParentUser != "" {
-			requestUser = cred.ParentUser
-		}
-
-		if requestUser != svcAccount.ParentUser {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
-	}
-
-	password := cred.SecretKey
-	reqBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
-		return
-	}
-
-	var updateReq madmin.UpdateServiceAccountReq
-	if err = json.Unmarshal(reqBytes, &updateReq); err != nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
-		return
-	}
-
-	var sp *iampolicy.Policy
-	if len(updateReq.NewPolicy) > 0 {
-		sp, err = iampolicy.ParseConfig(bytes.NewReader(updateReq.NewPolicy))
-		if err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
-	}
-	opts := updateServiceAccountOpts{
-		secretKey:     updateReq.NewSecretKey,
-		status:        updateReq.NewStatus,
-		sessionPolicy: sp,
-	}
-	err = globalIAMSys.UpdateServiceAccount(ctx, accessKey, opts)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	// Call site replication hook - non-root user accounts are replicated.
-	if svcAccount.ParentUser != globalActiveCred.AccessKey {
-		err = globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-			Type: madmin.SRIAMItemSvcAcc,
-			SvcAccChange: &madmin.SRSvcAccChange{
-				Update: &madmin.SRSvcAccUpdate{
-					AccessKey:     accessKey,
-					SecretKey:     opts.secretKey,
-					Status:        opts.status,
-					SessionPolicy: updateReq.NewPolicy,
-				},
-			},
-		})
-		if err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
-	}
-
-	writeSuccessNoContent(w)
-}
-
-// InfoServiceAccount - GET /minio/admin/v3/info-service-account
-func (a adminAPIHandlers) InfoServiceAccount(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "InfoServiceAccount")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	// Get current object layer instance.
-	objectAPI := newObjectLayerFn()
-	if objectAPI == nil || globalNotificationSys == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
-		return
-	}
-
-	cred, claims, owner, s3Err := validateAdminSignature(ctx, r, "")
-	if s3Err != ErrNone {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
-		return
-	}
-
-	accessKey := mux.Vars(r)["accessKey"]
-	if accessKey == "" {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
-		return
-	}
-
-	svcAccount, policy, err := globalIAMSys.GetServiceAccount(ctx, accessKey)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	if !globalIAMSys.IsAllowed(iampolicy.Args{
-		AccountName:     cred.AccessKey,
-		Action:          iampolicy.ListServiceAccountsAdminAction,
-		ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-		IsOwner:         owner,
-		Claims:          claims,
-	}) {
-		requestUser := cred.AccessKey
-		if cred.ParentUser != "" {
-			requestUser = cred.ParentUser
-		}
-
-		if requestUser != svcAccount.ParentUser {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
-	}
-
-	var svcAccountPolicy iampolicy.Policy
-
-	if policy != nil {
-		svcAccountPolicy = *policy
-	} else {
-		policiesNames, err := globalIAMSys.PolicyDBGet(svcAccount.ParentUser, false)
-		if err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
-		svcAccountPolicy = globalIAMSys.GetCombinedPolicy(policiesNames...)
-	}
-
-	policyJSON, err := json.MarshalIndent(svcAccountPolicy, "", " ")
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	infoResp := madmin.InfoServiceAccountResp{
-		ParentUser:    svcAccount.ParentUser,
-		AccountStatus: svcAccount.Status,
-		ImpliedPolicy: policy == nil,
-		Policy:        string(policyJSON),
-	}
-
-	data, err := json.Marshal(infoResp)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	encryptedData, err := madmin.EncryptData(cred.SecretKey, data)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -907,50 +534,31 @@ func (a adminAPIHandlers) ListServiceAccounts(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	cred, claims, owner, s3Err := validateAdminSignature(ctx, r, "")
+	cred, _, owner, s3Err := validateAdminSignature(ctx, r, "")
 	if s3Err != ErrNone {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
 	}
 
-	var targetAccount string
-
-	// If listing is requested for a specific user (who is not the request
-	// sender), check that the user has permissions.
-	user := r.Form.Get("user")
-	if user != "" && user != cred.AccessKey {
-		if !globalIAMSys.IsAllowed(iampolicy.Args{
-			AccountName:     cred.AccessKey,
-			Action:          iampolicy.ListServiceAccountsAdminAction,
-			ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-			IsOwner:         owner,
-			Claims:          claims,
-		}) {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
-		targetAccount = user
-	} else {
-		targetAccount = cred.AccessKey
-		if cred.ParentUser != "" {
-			targetAccount = cred.ParentUser
-		}
+	// Disallow creating service accounts by root user.
+	if owner {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminAccountNotEligible), r.URL)
+		return
 	}
 
-	serviceAccounts, err := globalIAMSys.ListServiceAccounts(ctx, targetAccount)
+	parentUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		parentUser = cred.ParentUser
+	}
+
+	serviceAccounts, err := globalIAMSys.ListServiceAccounts(ctx, parentUser)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	var serviceAccountsNames []string
-
-	for _, svc := range serviceAccounts {
-		serviceAccountsNames = append(serviceAccountsNames, svc.AccessKey)
-	}
-
-	listResp := madmin.ListServiceAccountsResp{
-		Accounts: serviceAccountsNames,
+	var listResp = madmin.ListServiceAccountsResp{
+		Accounts: serviceAccounts,
 	}
 
 	data, err := json.Marshal(listResp)
@@ -981,9 +589,15 @@ func (a adminAPIHandlers) DeleteServiceAccount(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	cred, claims, owner, s3Err := validateAdminSignature(ctx, r, "")
+	cred, _, owner, s3Err := validateAdminSignature(ctx, r, "")
 	if s3Err != ErrNone {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+		return
+	}
+
+	// Disallow creating service accounts by root user.
+	if owner {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminAccountNotEligible), r.URL)
 		return
 	}
 
@@ -993,54 +607,29 @@ func (a adminAPIHandlers) DeleteServiceAccount(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	svcAccount, _, err := globalIAMSys.GetServiceAccount(ctx, serviceAccount)
+	user, err := globalIAMSys.GetServiceAccountParent(ctx, serviceAccount)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	adminPrivilege := globalIAMSys.IsAllowed(iampolicy.Args{
-		AccountName:     cred.AccessKey,
-		Action:          iampolicy.RemoveServiceAccountAdminAction,
-		ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
-		IsOwner:         owner,
-		Claims:          claims,
-	})
-
-	if !adminPrivilege {
-		parentUser := cred.AccessKey
-		if cred.ParentUser != "" {
-			parentUser = cred.ParentUser
-		}
-		if parentUser != svcAccount.ParentUser {
-			// The service account belongs to another user but return not
-			// found error to mitigate brute force attacks. or the
-			// serviceAccount doesn't exist.
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminServiceAccountNotFound), r.URL)
-			return
-		}
+	parentUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		parentUser = cred.ParentUser
 	}
 
-	err = globalIAMSys.DeleteServiceAccount(ctx, serviceAccount, true)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+	if parentUser != user || user == "" {
+		// The service account belongs to another user but return not
+		// found error to mitigate brute force attacks. or the
+		// serviceAccount doesn't exist.
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServiceAccountNotFound), r.URL)
 		return
 	}
 
-	// Call site replication hook - non-root user accounts are replicated.
-	if svcAccount.ParentUser != globalActiveCred.AccessKey {
-		err = globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-			Type: madmin.SRIAMItemSvcAcc,
-			SvcAccChange: &madmin.SRSvcAccChange{
-				Delete: &madmin.SRSvcAccDelete{
-					AccessKey: serviceAccount,
-				},
-			},
-		})
-		if err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
+	err = globalIAMSys.DeleteServiceAccount(ctx, serviceAccount)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
 	}
 
 	writeSuccessNoContent(w)
@@ -1071,13 +660,11 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 	// Set delimiter value for "s3:delimiter" policy conditionals.
 	r.Header.Set("delimiter", SlashSeparator)
 
-	// Check if we are asked to return prefix usage
-	enablePrefixUsage := r.Form.Get("prefix-usage") == "true"
-
 	isAllowedAccess := func(bucketName string) (rd, wr bool) {
+		// Use the following trick to filter in place
+		// https://github.com/golang/go/wiki/SliceTricks#filter-in-place
 		if globalIAMSys.IsAllowed(iampolicy.Args{
 			AccountName:     cred.AccessKey,
-			Groups:          cred.Groups,
 			Action:          iampolicy.ListBucketAction,
 			BucketName:      bucketName,
 			ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
@@ -1090,7 +677,6 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 
 		if globalIAMSys.IsAllowed(iampolicy.Args{
 			AccountName:     cred.AccessKey,
-			Groups:          cred.Groups,
 			Action:          iampolicy.PutObjectAction,
 			BucketName:      bucketName,
 			ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
@@ -1104,11 +690,11 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 		return rd, wr
 	}
 
-	var dataUsageInfo DataUsageInfo
-	var err error
-	if !globalIsGateway {
-		// Load the latest calculated data usage
-		dataUsageInfo, _ = loadDataUsageFromBackend(ctx, objectAPI)
+	// Load the latest calculated data usage
+	dataUsageInfo, err := loadDataUsageFromBackend(ctx, objectAPI)
+	if err != nil {
+		// log the error, continue with the accounting response
+		logger.LogIf(ctx, err)
 	}
 
 	// If etcd, dns federation configured list buckets from etcd.
@@ -1118,7 +704,7 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 		if err != nil && !IsErrIgnored(err,
 			dns.ErrNoEntriesFound,
 			dns.ErrDomainMissing) {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 			return
 		}
 		for _, dnsRecords := range dnsBuckets {
@@ -1139,67 +725,34 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	accountName := cred.AccessKey
-	if cred.IsTemp() || cred.IsServiceAccount() {
-		// For derived credentials, check the parent user's permissions.
+	if cred.ParentUser != "" {
 		accountName = cred.ParentUser
 	}
-	policies, err := globalIAMSys.PolicyDBGet(accountName, false, cred.Groups...)
+
+	policies, err := globalIAMSys.PolicyDBGet(accountName, false)
 	if err != nil {
 		logger.LogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	buf, err := json.MarshalIndent(globalIAMSys.GetCombinedPolicy(policies...), "", " ")
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
 	acctInfo := madmin.AccountInfo{
 		AccountName: accountName,
-		Server:      objectAPI.BackendInfo(),
-		Policy:      buf,
+		Policy:      globalIAMSys.GetCombinedPolicy(policies...),
 	}
 
 	for _, bucket := range buckets {
 		rd, wr := isAllowedAccess(bucket.Name)
 		if rd || wr {
-			// Fetch the data usage of the current bucket
 			var size uint64
-			var objectsCount uint64
-			var objectsHist map[string]uint64
+			// Fetch the data usage of the current bucket
 			if !dataUsageInfo.LastUpdate.IsZero() {
 				size = dataUsageInfo.BucketsUsage[bucket.Name].Size
-				objectsCount = dataUsageInfo.BucketsUsage[bucket.Name].ObjectsCount
-				objectsHist = dataUsageInfo.BucketsUsage[bucket.Name].ObjectSizesHistogram
 			}
-			// Fetch the prefix usage of the current bucket
-			var prefixUsage map[string]uint64
-			if enablePrefixUsage {
-				prefixUsage, _ = loadPrefixUsageFromBackend(ctx, objectAPI, bucket.Name)
-			}
-
-			lcfg, _ := globalBucketObjectLockSys.Get(bucket.Name)
-			quota, _ := globalBucketQuotaSys.Get(ctx, bucket.Name)
-			rcfg, _ := globalBucketMetadataSys.GetReplicationConfig(ctx, bucket.Name)
-			tcfg, _ := globalBucketMetadataSys.GetTaggingConfig(bucket.Name)
-
-			acctInfo.Buckets = append(acctInfo.Buckets, madmin.BucketAccessInfo{
-				Name:                 bucket.Name,
-				Created:              bucket.Created,
-				Size:                 size,
-				Objects:              objectsCount,
-				ObjectSizesHistogram: objectsHist,
-				PrefixUsage:          prefixUsage,
-				Details: &madmin.BucketDetails{
-					Versioning:          globalBucketVersioningSys.Enabled(bucket.Name),
-					VersioningSuspended: globalBucketVersioningSys.Suspended(bucket.Name),
-					Replication:         rcfg != nil,
-					Locking:             lcfg.LockEnabled,
-					Quota:               quota,
-					Tagging:             tcfg,
-				},
+			acctInfo.Buckets = append(acctInfo.Buckets, madmin.BucketUsageInfo{
+				Name:    bucket.Name,
+				Created: bucket.Created,
+				Size:    size,
 				Access: madmin.AccountAccess{
 					Read:  rd,
 					Write: wr,
@@ -1217,95 +770,89 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 	writeSuccessResponseJSON(w, usageInfoJSON)
 }
 
+// InfoCannedPolicyV2 - GET /minio/admin/v2/info-canned-policy?name={policyName}
+func (a adminAPIHandlers) InfoCannedPolicyV2(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "InfoCannedPolicyV2")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.GetPolicyAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	policy, err := globalIAMSys.InfoPolicy(mux.Vars(r)["name"])
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	data, err := json.Marshal(policy)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	w.Write(data)
+	w.(http.Flusher).Flush()
+}
+
 // InfoCannedPolicy - GET /minio/admin/v3/info-canned-policy?name={policyName}
-//
-// Newer API response with policy timestamps is returned with query parameter
-// `v=2` like:
-//
-// GET /minio/admin/v3/info-canned-policy?name={policyName}&v=2
-//
-// The newer API will eventually become the default (and only) one. The older
-// response is to return only the policy JSON. The newer response returns
-// timestamps along with the policy JSON. Both versions are supported for now,
-// for smooth transition to new API.
 func (a adminAPIHandlers) InfoCannedPolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "InfoCannedPolicy")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.GetPolicyAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.GetPolicyAdminAction)
 	if objectAPI == nil {
 		return
 	}
 
-	name := mux.Vars(r)["name"]
-	policies := newMappedPolicy(name).toSlice()
-	if len(policies) != 1 {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errTooManyPolicies), r.URL)
-		return
-	}
-
-	policyDoc, err := globalIAMSys.InfoPolicy(name)
+	policy, err := globalIAMSys.InfoPolicy(mux.Vars(r)["name"])
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	// Is the new API version being requested?
-	infoPolicyAPIVersion := r.Form.Get("v")
-	if infoPolicyAPIVersion == "2" {
-		buf, err := json.MarshalIndent(policyDoc, "", " ")
-		if err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
-		w.Write(buf)
-		return
-	} else if infoPolicyAPIVersion != "" {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errors.New("invalid version parameter 'v' supplied")), r.URL)
-		return
-	}
-
-	// Return the older API response value of just the policy json.
-	buf, err := json.MarshalIndent(policyDoc.Policy, "", " ")
-	if err != nil {
+	if err = json.NewEncoder(w).Encode(policy); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
-	w.Write(buf)
+	w.(http.Flusher).Flush()
 }
 
-// ListBucketPolicies - GET /minio/admin/v3/list-canned-policies?bucket={bucket}
-func (a adminAPIHandlers) ListBucketPolicies(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListBucketPolicies")
+// ListCannedPoliciesV2 - GET /minio/admin/v2/list-canned-policies
+func (a adminAPIHandlers) ListCannedPoliciesV2(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ListCannedPoliciesV2")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ListUserPoliciesAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.ListUserPoliciesAdminAction)
 	if objectAPI == nil {
 		return
 	}
 
-	bucket := mux.Vars(r)["bucket"]
-	policies, err := globalIAMSys.ListPolicies(ctx, bucket)
+	policies, err := globalIAMSys.ListPolicies()
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	newPolicies := make(map[string]iampolicy.Policy)
-	for name, p := range policies {
-		_, err = json.Marshal(p)
+	policyMap := make(map[string][]byte, len(policies))
+	for k, p := range policies {
+		var err error
+		policyMap[k], err = json.Marshal(p)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			continue
 		}
-		newPolicies[name] = p
 	}
-	if err = json.NewEncoder(w).Encode(newPolicies); err != nil {
+	if err = json.NewEncoder(w).Encode(policyMap); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
+
+	w.(http.Flusher).Flush()
 }
 
 // ListCannedPolicies - GET /minio/admin/v3/list-canned-policies
@@ -1314,18 +861,18 @@ func (a adminAPIHandlers) ListCannedPolicies(w http.ResponseWriter, r *http.Requ
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ListUserPoliciesAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.ListUserPoliciesAdminAction)
 	if objectAPI == nil {
 		return
 	}
 
-	policies, err := globalIAMSys.ListPolicies(ctx, "")
+	policies, err := globalIAMSys.ListPolicies()
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	newPolicies := make(map[string]iampolicy.Policy)
+	var newPolicies = make(map[string]iampolicy.Policy)
 	for name, p := range policies {
 		_, err = json.Marshal(p)
 		if err != nil {
@@ -1338,6 +885,8 @@ func (a adminAPIHandlers) ListCannedPolicies(w http.ResponseWriter, r *http.Requ
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
+
+	w.(http.Flusher).Flush()
 }
 
 // RemoveCannedPolicy - DELETE /minio/admin/v3/remove-canned-policy?name=<policy_name>
@@ -1346,7 +895,7 @@ func (a adminAPIHandlers) RemoveCannedPolicy(w http.ResponseWriter, r *http.Requ
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DeletePolicyAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.DeletePolicyAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -1354,19 +903,17 @@ func (a adminAPIHandlers) RemoveCannedPolicy(w http.ResponseWriter, r *http.Requ
 	vars := mux.Vars(r)
 	policyName := vars["name"]
 
-	if err := globalIAMSys.DeletePolicy(ctx, policyName, true); err != nil {
+	if err := globalIAMSys.DeletePolicy(policyName); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	// Call cluster-replication policy creation hook to replicate policy deletion to
-	// other minio clusters.
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type: madmin.SRIAMItemPolicy,
-		Name: policyName,
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other MinIO peers to delete policy
+	for _, nerr := range globalNotificationSys.DeletePolicy(policyName) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
 }
 
@@ -1376,7 +923,7 @@ func (a adminAPIHandlers) AddCannedPolicy(w http.ResponseWriter, r *http.Request
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.CreatePolicyAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.CreatePolicyAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -1396,13 +943,7 @@ func (a adminAPIHandlers) AddCannedPolicy(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	iamPolicyBytes, err := ioutil.ReadAll(io.LimitReader(r.Body, r.ContentLength))
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	iamPolicy, err := iampolicy.ParseConfig(bytes.NewReader(iamPolicyBytes))
+	iamPolicy, err := iampolicy.ParseConfig(io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -1414,20 +955,17 @@ func (a adminAPIHandlers) AddCannedPolicy(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err = globalIAMSys.SetPolicy(ctx, policyName, *iamPolicy); err != nil {
+	if err = globalIAMSys.SetPolicy(policyName, *iamPolicy); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	// Call cluster-replication policy creation hook to replicate policy to
-	// other minio clusters.
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type:   madmin.SRIAMItemPolicy,
-		Name:   policyName,
-		Policy: iamPolicyBytes,
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other MinIO peers to reload policy
+	for _, nerr := range globalNotificationSys.LoadPolicy(policyName) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
 }
 
@@ -1437,7 +975,7 @@ func (a adminAPIHandlers) SetPolicyForUserOrGroup(w http.ResponseWriter, r *http
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.AttachPolicyAdminAction)
+	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.AttachPolicyAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -1448,7 +986,7 @@ func (a adminAPIHandlers) SetPolicyForUserOrGroup(w http.ResponseWriter, r *http
 	isGroup := vars["isGroup"] == "true"
 
 	if !isGroup {
-		ok, _, err := globalIAMSys.IsTempUser(entityName)
+		ok, err := globalIAMSys.IsTempUser(entityName)
 		if err != nil && err != errNoSuchUser {
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
@@ -1459,20 +997,16 @@ func (a adminAPIHandlers) SetPolicyForUserOrGroup(w http.ResponseWriter, r *http
 		}
 	}
 
-	if err := globalIAMSys.PolicyDBSet(ctx, entityName, policyName, isGroup); err != nil {
+	if err := globalIAMSys.PolicyDBSet(entityName, policyName, isGroup); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-		Type: madmin.SRIAMItemPolicyMapping,
-		PolicyMapping: &madmin.SRPolicyMapping{
-			UserOrGroup: entityName,
-			IsGroup:     isGroup,
-			Policy:      policyName,
-		},
-	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+	// Notify all other MinIO peers to reload policy
+	for _, nerr := range globalNotificationSys.LoadPolicyMapping(entityName, isGroup) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, nerr.Err)
+		}
 	}
 }

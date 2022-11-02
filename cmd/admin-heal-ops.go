@@ -1,34 +1,33 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 // healStatusSummary - overall short summary of a healing sequence
@@ -91,9 +90,8 @@ type allHealState struct {
 	sync.RWMutex
 
 	// map of heal path to heal sequence
-	healSeqMap     map[string]*healSequence // Indexed by endpoint
+	healSeqMap     map[string]*healSequence
 	healLocalDisks map[Endpoint]struct{}
-	healStatus     map[string]healingTracker // Indexed by disk ID
 }
 
 // newHealState - initialize global heal state management
@@ -101,7 +99,6 @@ func newHealState(cleanup bool) *allHealState {
 	hstate := &allHealState{
 		healSeqMap:     make(map[string]*healSequence),
 		healLocalDisks: map[Endpoint]struct{}{},
-		healStatus:     make(map[string]healingTracker),
 	}
 	if cleanup {
 		go hstate.periodicHealSeqsClean(GlobalContext)
@@ -116,56 +113,7 @@ func (ahs *allHealState) healDriveCount() int {
 	return len(ahs.healLocalDisks)
 }
 
-func (ahs *allHealState) popHealLocalDisks(healLocalDisks ...Endpoint) {
-	ahs.Lock()
-	defer ahs.Unlock()
-
-	for _, ep := range healLocalDisks {
-		delete(ahs.healLocalDisks, ep)
-	}
-	for id, disk := range ahs.healStatus {
-		for _, ep := range healLocalDisks {
-			if disk.Endpoint == ep.String() {
-				delete(ahs.healStatus, id)
-			}
-		}
-	}
-}
-
-// updateHealStatus will update the heal status.
-func (ahs *allHealState) updateHealStatus(tracker *healingTracker) {
-	ahs.Lock()
-	defer ahs.Unlock()
-	ahs.healStatus[tracker.ID] = *tracker
-}
-
-// Sort by zone, set and disk index
-func sortDisks(disks []madmin.Disk) {
-	sort.Slice(disks, func(i, j int) bool {
-		a, b := &disks[i], &disks[j]
-		if a.PoolIndex != b.PoolIndex {
-			return a.PoolIndex < b.PoolIndex
-		}
-		if a.SetIndex != b.SetIndex {
-			return a.SetIndex < b.SetIndex
-		}
-		return a.DiskIndex < b.DiskIndex
-	})
-}
-
-// getLocalHealingDisks returns local healing disks indexed by endpoint.
-func (ahs *allHealState) getLocalHealingDisks() map[string]madmin.HealingDisk {
-	ahs.RLock()
-	defer ahs.RUnlock()
-	dst := make(map[string]madmin.HealingDisk, len(ahs.healStatus))
-	for _, v := range ahs.healStatus {
-		dst[v.Endpoint] = v.toHealingDisk()
-	}
-
-	return dst
-}
-
-func (ahs *allHealState) getHealLocalDiskEndpoints() Endpoints {
+func (ahs *allHealState) getHealLocalDisks() Endpoints {
 	ahs.RLock()
 	defer ahs.RUnlock()
 
@@ -174,6 +122,15 @@ func (ahs *allHealState) getHealLocalDiskEndpoints() Endpoints {
 		endpoints = append(endpoints, ep)
 	}
 	return endpoints
+}
+
+func (ahs *allHealState) popHealLocalDisks(healLocalDisks ...Endpoint) {
+	ahs.Lock()
+	defer ahs.Unlock()
+
+	for _, ep := range healLocalDisks {
+		delete(ahs.healLocalDisks, ep)
+	}
 }
 
 func (ahs *allHealState) pushHealLocalDisks(healLocalDisks ...Endpoint) {
@@ -278,8 +235,8 @@ func (ahs *allHealState) stopHealSequence(path string) ([]byte, APIError) {
 // background routine to clean up heal results after the
 // aforementioned duration.
 func (ahs *allHealState) LaunchNewHealSequence(h *healSequence, objAPI ObjectLayer) (
-	respBytes []byte, apiErr APIError, errMsg string,
-) {
+	respBytes []byte, apiErr APIError, errMsg string) {
+
 	if h.forceStarted {
 		_, apiErr = ahs.stopHealSequence(pathJoin(h.bucket, h.object))
 		if apiErr.Code != "" {
@@ -338,8 +295,8 @@ func (ahs *allHealState) LaunchNewHealSequence(h *healSequence, objAPI ObjectLay
 // representation. The clientToken helps ensure there aren't
 // conflicting clients fetching status.
 func (ahs *allHealState) PopHealStatusJSON(hpath string,
-	clientToken string) ([]byte, APIErrorCode,
-) {
+	clientToken string) ([]byte, APIErrorCode) {
+
 	// fetch heal state for given path
 	h, exists := ahs.getHealSequence(hpath)
 	if !exists {
@@ -397,6 +354,9 @@ type healSequence struct {
 	// bucket, and object on which heal seq. was initiated
 	bucket, object string
 
+	// A channel of entities (format, buckets, objects) to heal
+	sourceCh chan healSource
+
 	// A channel of entities with heal result
 	respCh chan healResult
 
@@ -453,8 +413,8 @@ type healSequence struct {
 // NewHealSequence - creates healSettings, assumes bucket and
 // objPrefix are already validated.
 func newHealSequence(ctx context.Context, bucket, objPrefix, clientAddr string,
-	hs madmin.HealOpts, forceStart bool,
-) *healSequence {
+	hs madmin.HealOpts, forceStart bool) *healSequence {
+
 	reqInfo := &logger.ReqInfo{RemoteHost: clientAddr, API: "Heal", BucketName: bucket}
 	reqInfo.AppendTags("prefix", objPrefix)
 	ctx, cancel := context.WithCancel(logger.SetReqInfo(ctx, reqInfo))
@@ -484,6 +444,22 @@ func newHealSequence(ctx context.Context, bucket, objPrefix, clientAddr string,
 	}
 }
 
+// resetHealStatusCounters - reset the healSequence status counters between
+// each monthly background heal scanning activity.
+// This is used only in case of Background healing scenario, where
+// we use a single long running healSequence which reactively heals
+// objects passed to the SourceCh.
+func (h *healSequence) resetHealStatusCounters() {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	h.currentStatus.Items = []madmin.HealResultItem{}
+	h.lastSentResultIndex = 0
+	h.scannedItemsMap = make(map[madmin.HealItemType]int64)
+	h.healedItemsMap = make(map[madmin.HealItemType]int64)
+	h.healFailedItemsMap = make(map[string]int64)
+}
+
 // getScannedItemsCount - returns a count of all scanned items
 func (h *healSequence) getScannedItemsCount() int64 {
 	var count int64
@@ -491,7 +467,7 @@ func (h *healSequence) getScannedItemsCount() int64 {
 	defer h.mutex.RUnlock()
 
 	for _, v := range h.scannedItemsMap {
-		count += v
+		count = count + v
 	}
 	return count
 }
@@ -646,7 +622,11 @@ func (h *healSequence) healSequenceStart(objAPI ObjectLayer) {
 	h.currentStatus.StartTime = UTCNow()
 	h.mutex.Unlock()
 
-	go h.traverseAndHeal(objAPI)
+	if h.sourceCh == nil {
+		go h.traverseAndHeal(objAPI)
+	} else {
+		go h.healFromSourceCh()
+	}
 
 	select {
 	case err, ok := <-h.traverseAndHealDoneCh:
@@ -682,47 +662,46 @@ func (h *healSequence) healSequenceStart(objAPI ObjectLayer) {
 	}
 }
 
-func (h *healSequence) logHeal(healType madmin.HealItemType) {
-	h.mutex.Lock()
-	h.scannedItemsMap[healType]++
-	h.lastHealActivity = UTCNow()
-	h.mutex.Unlock()
-}
-
 func (h *healSequence) queueHealTask(source healSource, healType madmin.HealItemType) error {
+	globalHealConfigMu.Lock()
+	opts := globalHealConfig
+	globalHealConfigMu.Unlock()
+
 	// Send heal request
 	task := healTask{
-		bucket:    source.bucket,
-		object:    source.object,
-		versionID: source.versionID,
-		opts:      h.settings,
-		respCh:    h.respCh,
+		bucket:     source.bucket,
+		object:     source.object,
+		versionID:  source.versionID,
+		opts:       h.settings,
+		responseCh: h.respCh,
 	}
 	if source.opts != nil {
 		task.opts = *source.opts
-	} else {
-		task.opts.ScanMode = madmin.HealNormalScan
 	}
+	if opts.Bitrot {
+		task.opts.ScanMode = madmin.HealDeepScan
+	}
+
+	// Wait and proceed if there are active requests
+	waitForLowHTTPReq(opts.IOCount, opts.Sleep)
 
 	h.mutex.Lock()
 	h.scannedItemsMap[healType]++
 	h.lastHealActivity = UTCNow()
 	h.mutex.Unlock()
 
-	select {
-	case globalBackgroundHealRoutine.tasks <- task:
-		if serverDebugLog {
-			logger.Info("Task in the queue: %#v", task)
-		}
-	case <-h.ctx.Done():
-		return nil
-	}
+	globalBackgroundHealRoutine.queueHealTask(task)
 
 	select {
 	case res := <-h.respCh:
 		if !h.reportProgress {
-			if errors.Is(res.err, errSkipFile) { // this is only sent usually by nopHeal
-				return nil
+			// Object might have been deleted, by the time heal
+			// was attempted, we should ignore this object and
+			// return the error and not calculate this object
+			// as part of the metrics.
+			if isErrObjectNotFound(res.err) || isErrVersionNotFound(res.err) {
+				// Return the error so that caller can handle it.
+				return res.err
 			}
 
 			h.mutex.Lock()
@@ -747,6 +726,11 @@ func (h *healSequence) queueHealTask(source healSource, healType madmin.HealItem
 		}
 		res.result.Type = healType
 		if res.err != nil {
+			// Object might have been deleted, by the time heal
+			// was attempted, we should ignore this object and return success.
+			if isErrObjectNotFound(res.err) || isErrVersionNotFound(res.err) {
+				return nil
+			}
 			// Only report object error
 			if healType != madmin.HealItemObject {
 				return res.err
@@ -759,7 +743,59 @@ func (h *healSequence) queueHealTask(source healSource, healType madmin.HealItem
 	}
 }
 
+func (h *healSequence) healItemsFromSourceCh() error {
+	for {
+		select {
+		case source, ok := <-h.sourceCh:
+			if !ok {
+				return nil
+			}
+
+			var itemType madmin.HealItemType
+			switch source.bucket {
+			case nopHeal:
+				continue
+			case SlashSeparator:
+				itemType = madmin.HealItemMetadata
+			default:
+				if source.object == "" {
+					itemType = madmin.HealItemBucket
+				} else {
+					itemType = madmin.HealItemObject
+				}
+			}
+
+			if err := h.queueHealTask(source, itemType); err != nil {
+				switch err.(type) {
+				case ObjectExistsAsDirectory:
+				case ObjectNotFound:
+				case VersionNotFound:
+				default:
+					logger.LogIf(h.ctx, fmt.Errorf("Heal attempt failed for %s: %w",
+						pathJoin(source.bucket, source.object), err))
+				}
+			}
+		case <-h.ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (h *healSequence) healFromSourceCh() {
+	h.healItemsFromSourceCh()
+}
+
 func (h *healSequence) healDiskMeta(objAPI ObjectLayer) error {
+	// Try to pro-actively heal backend-encrypted file.
+	if err := h.queueHealTask(healSource{
+		bucket: minioMetaBucket,
+		object: backendEncryptedFile,
+	}, madmin.HealItemBucketMetadata); err != nil {
+		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			return err
+		}
+	}
+
 	// Start healing the config prefix.
 	return h.healMinioSysMeta(objAPI, minioConfigPrefix)()
 }
@@ -798,11 +834,21 @@ func (h *healSequence) healMinioSysMeta(objAPI ObjectLayer, metaPrefix string) f
 				return errHealStopSignalled
 			}
 
+			// Skip metacache entries healing
+			if strings.HasPrefix(object, "buckets/.minio.sys/.metacache/") {
+				return nil
+			}
+
 			err := h.queueHealTask(healSource{
 				bucket:    bucket,
 				object:    object,
 				versionID: versionID,
 			}, madmin.HealItemBucketMetadata)
+			// Object might have been deleted, by the time heal
+			// was attempted we ignore this object an move on.
+			if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+				return nil
+			}
 			return err
 		})
 	}
@@ -851,7 +897,9 @@ func (h *healSequence) healBuckets(objAPI ObjectLayer, bucketsOnly bool) error {
 // healBucket - traverses and heals given bucket
 func (h *healSequence) healBucket(objAPI ObjectLayer, bucket string, bucketsOnly bool) error {
 	if err := h.queueHealTask(healSource{bucket: bucket}, madmin.HealItemBucket); err != nil {
-		return err
+		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			return err
+		}
 	}
 
 	if bucketsOnly {
@@ -865,6 +913,9 @@ func (h *healSequence) healBucket(objAPI ObjectLayer, bucket string, bucketsOnly
 			oi, err := objAPI.GetObjectInfo(h.ctx, bucket, h.object, ObjectOptions{})
 			if err == nil {
 				if err = h.healObject(bucket, h.object, oi.VersionID); err != nil {
+					if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+						return nil
+					}
 					return err
 				}
 			}
@@ -874,7 +925,11 @@ func (h *healSequence) healBucket(objAPI ObjectLayer, bucket string, bucketsOnly
 	}
 
 	if err := objAPI.HealObjects(h.ctx, bucket, h.object, h.settings, h.healObject); err != nil {
-		return errFnHealFromAPIErr(h.ctx, err)
+		// Object might have been deleted, by the time heal
+		// was attempted we ignore this object an move on.
+		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			return errFnHealFromAPIErr(h.ctx, err)
+		}
 	}
 	return nil
 }
@@ -889,11 +944,6 @@ func (h *healSequence) healObject(bucket, object, versionID string) error {
 		bucket:    bucket,
 		object:    object,
 		versionID: versionID,
-		opts:      &h.settings,
 	}, madmin.HealItemObject)
-
-	// Wait and proceed if there are active requests
-	waitForLowHTTPReq()
-
 	return err
 }

@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -29,19 +28,17 @@ import (
 	"path"
 	"time"
 
-	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	bucketsse "github.com/minio/minio/internal/bucket/encryption"
-	"github.com/minio/minio/internal/bucket/lifecycle"
-	objectlock "github.com/minio/minio/internal/bucket/object/lock"
-	"github.com/minio/minio/internal/bucket/replication"
-	"github.com/minio/minio/internal/bucket/versioning"
-	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/minio/internal/event"
-	"github.com/minio/minio/internal/fips"
-	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/minio/cmd/crypto"
+	"github.com/minio/minio/cmd/logger"
+	bucketsse "github.com/minio/minio/pkg/bucket/encryption"
+	"github.com/minio/minio/pkg/bucket/lifecycle"
+	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/replication"
+	"github.com/minio/minio/pkg/bucket/versioning"
+	"github.com/minio/minio/pkg/event"
+	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/sio"
 )
 
@@ -120,7 +117,7 @@ func (b *BucketMetadata) Load(ctx context.Context, api ObjectLayer, name string)
 		logger.LogIf(ctx, errors.New("bucket name cannot be empty"))
 		return errors.New("bucket name cannot be empty")
 	}
-	configFile := path.Join(bucketMetaPrefix, name, bucketMetadataFile)
+	configFile := path.Join(bucketConfigPrefix, name, bucketMetadataFile)
 	data, err := readConfig(ctx, api, configFile)
 	if err != nil {
 		return err
@@ -277,7 +274,7 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 	}
 
 	for _, legacyFile := range legacyConfigs {
-		configFile := path.Join(bucketMetaPrefix, b.Name, legacyFile)
+		configFile := path.Join(bucketConfigPrefix, b.Name, legacyFile)
 
 		configData, err := readConfig(ctx, objectAPI, configFile)
 		if err != nil {
@@ -338,7 +335,7 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 	}
 
 	for legacyFile := range configs {
-		configFile := path.Join(bucketMetaPrefix, b.Name, legacyFile)
+		configFile := path.Join(bucketConfigPrefix, b.Name, legacyFile)
 		if err := deleteConfig(ctx, objectAPI, configFile); err != nil && !errors.Is(err, errConfigNotFound) {
 			logger.LogIf(ctx, err)
 		}
@@ -365,7 +362,7 @@ func (b *BucketMetadata) Save(ctx context.Context, api ObjectLayer) error {
 		return err
 	}
 
-	configFile := path.Join(bucketMetaPrefix, b.Name, bucketMetadataFile)
+	configFile := path.Join(bucketConfigPrefix, b.Name, bucketMetadataFile)
 	return saveConfig(ctx, api, configFile, data)
 }
 
@@ -375,10 +372,9 @@ func deleteBucketMetadata(ctx context.Context, obj objectDeleter, bucket string)
 	metadataFiles := []string{
 		dataUsageCacheName,
 		bucketMetadataFile,
-		path.Join(replicationDir, resyncFileName),
 	}
 	for _, metaFile := range metadataFiles {
-		configFile := path.Join(bucketMetaPrefix, bucket, metaFile)
+		configFile := path.Join(bucketConfigPrefix, bucket, metaFile)
 		if err := deleteConfig(ctx, obj, configFile); err != nil && err != errConfigNotFound {
 			return err
 		}
@@ -394,7 +390,7 @@ func (b *BucketMetadata) migrateTargetConfig(ctx context.Context, objectAPI Obje
 		return nil
 	}
 
-	encBytes, metaBytes, err := encryptBucketMetadata(b.Name, b.BucketTargetsConfigJSON, kms.Context{b.Name: b.Name, bucketTargetsFile: bucketTargetsFile})
+	encBytes, metaBytes, err := encryptBucketMetadata(b.Name, b.BucketTargetsConfigJSON, crypto.Context{b.Name: b.Name, bucketTargetsFile: bucketTargetsFile})
 	if err != nil {
 		return err
 	}
@@ -405,23 +401,26 @@ func (b *BucketMetadata) migrateTargetConfig(ctx context.Context, objectAPI Obje
 }
 
 // encrypt bucket metadata if kms is configured.
-func encryptBucketMetadata(bucket string, input []byte, kmsContext kms.Context) (output, metabytes []byte, err error) {
+func encryptBucketMetadata(bucket string, input []byte, kmsContext crypto.Context) (output, metabytes []byte, err error) {
+	var sealedKey crypto.SealedKey
 	if GlobalKMS == nil {
 		output = input
 		return
 	}
-
+	var (
+		key    [32]byte
+		encKey []byte
+	)
 	metadata := make(map[string]string)
-	key, err := GlobalKMS.GenerateKey("", kmsContext)
+	key, encKey, err = GlobalKMS.GenerateKey(GlobalKMS.DefaultKeyID(), kmsContext)
 	if err != nil {
 		return
 	}
-
 	outbuf := bytes.NewBuffer(nil)
-	objectKey := crypto.GenerateKey(key.Plaintext, rand.Reader)
-	sealedKey := objectKey.Seal(key.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3.String(), bucket, "")
-	crypto.S3.CreateMetadata(metadata, key.KeyID, key.Ciphertext, sealedKey)
-	_, err = sio.Encrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	objectKey := crypto.GenerateKey(key, rand.Reader)
+	sealedKey = objectKey.Seal(key, crypto.GenerateIV(rand.Reader), crypto.S3.String(), bucket, "")
+	crypto.S3.CreateMetadata(metadata, GlobalKMS.DefaultKeyID(), encKey, sealedKey)
+	_, err = sio.Encrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20})
 	if err != nil {
 		return output, metabytes, err
 	}
@@ -433,15 +432,16 @@ func encryptBucketMetadata(bucket string, input []byte, kmsContext kms.Context) 
 }
 
 // decrypt bucket metadata if kms is configured.
-func decryptBucketMetadata(input []byte, bucket string, meta map[string]string, kmsContext kms.Context) ([]byte, error) {
+func decryptBucketMetadata(input []byte, bucket string, meta map[string]string, kmsContext crypto.Context) ([]byte, error) {
 	if GlobalKMS == nil {
 		return nil, errKMSNotConfigured
 	}
 	keyID, kmsKey, sealedKey, err := crypto.S3.ParseMetadata(meta)
+
 	if err != nil {
 		return nil, err
 	}
-	extKey, err := GlobalKMS.DecryptKey(keyID, kmsKey, kmsContext)
+	extKey, err := GlobalKMS.UnsealKey(keyID, kmsKey, kmsContext)
 	if err != nil {
 		return nil, err
 	}
@@ -449,8 +449,8 @@ func decryptBucketMetadata(input []byte, bucket string, meta map[string]string, 
 	if err = objectKey.Unseal(extKey, sealedKey, crypto.S3.String(), bucket, ""); err != nil {
 		return nil, err
 	}
-
 	outbuf := bytes.NewBuffer(nil)
-	_, err = sio.Decrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	_, err = sio.Decrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20})
+
 	return outbuf.Bytes(), err
 }

@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -58,7 +57,7 @@ func reliableRemoveAll(dirPath string) (err error) {
 	i := 0
 	for {
 		// Removes all the directories and files.
-		if err = RemoveAll(dirPath); err != nil {
+		if err = os.RemoveAll(dirPath); err != nil {
 			// Retry only for the first retryable error.
 			if isSysErrNotEmpty(err) && i == 0 {
 				i++
@@ -92,10 +91,8 @@ func mkdirAll(dirPath string, mode os.FileMode) (err error) {
 			// directory" error message. Handle this specifically here.
 			return errFileAccessDenied
 		}
-		return osErrToFileErr(err)
 	}
-
-	return nil
+	return err
 }
 
 // Reliably retries os.MkdirAll if for some reason os.MkdirAll returns
@@ -104,7 +101,7 @@ func reliableMkdirAll(dirPath string, mode os.FileMode) (err error) {
 	i := 0
 	for {
 		// Creates all the parent directories, with mode 0777 mkdir honors system umask.
-		if err = MkdirAll(dirPath, mode); err != nil {
+		if err = os.MkdirAll(dirPath, mode); err != nil {
 			// Retry only for the first retryable error.
 			if osIsNotExist(err) && i == 0 {
 				i++
@@ -136,7 +133,7 @@ func renameAll(srcFilePath, dstFilePath string) (err error) {
 		switch {
 		case isSysErrNotDir(err) && !osIsNotExist(err):
 			// Windows can have both isSysErrNotDir(err) and osIsNotExist(err) returning
-			// true if the source file path contains an non-existent directory. In that case,
+			// true if the source file path contains an inexistant directory. In that case,
 			// we want to return errFileNotFound instead, which will honored in subsequent
 			// switch cases
 			return errFileAccessDenied
@@ -163,13 +160,13 @@ func renameAll(srcFilePath, dstFilePath string) (err error) {
 // Reliably retries os.RenameAll if for some reason os.RenameAll returns
 // syscall.ENOENT (parent does not exist).
 func reliableRename(srcFilePath, dstFilePath string) (err error) {
-	if err = reliableMkdirAll(path.Dir(dstFilePath), 0o777); err != nil {
+	if err = reliableMkdirAll(path.Dir(dstFilePath), 0777); err != nil {
 		return err
 	}
 	i := 0
 	for {
 		// After a successful parent directory create attempt a renameAll.
-		if err = Rename(srcFilePath, dstFilePath); err != nil {
+		if err = os.Rename(srcFilePath, dstFilePath); err != nil {
 			// Retry only for the first retryable error.
 			if osIsNotExist(err) && i == 0 {
 				i++

@@ -1,31 +1,27 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"bytes"
-	"context"
+	"io"
 	"os"
 	"sort"
 	"strings"
-
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/console"
 )
 
 // metaCacheEntry is an object or a directory within an unknown bucket.
@@ -37,15 +33,12 @@ type metaCacheEntry struct {
 	metadata []byte
 
 	// cached contains the metadata if decoded.
-	cached *xlMetaV2
-
-	// Indicates the entry can be reused and only one reference to metadata is expected.
-	reusable bool
+	cached *FileInfo
 }
 
 // isDir returns if the entry is representing a prefix directory.
 func (e metaCacheEntry) isDir() bool {
-	return len(e.metadata) == 0 && strings.HasSuffix(e.name, slashSeparator)
+	return len(e.metadata) == 0
 }
 
 // isObject returns if the entry is representing an object.
@@ -53,90 +46,41 @@ func (e metaCacheEntry) isObject() bool {
 	return len(e.metadata) > 0
 }
 
-// isObjectDir returns if the entry is representing an object__XL_DIR__
-func (e metaCacheEntry) isObjectDir() bool {
-	return len(e.metadata) > 0 && strings.HasSuffix(e.name, slashSeparator)
-}
-
 // hasPrefix returns whether an entry has a specific prefix
 func (e metaCacheEntry) hasPrefix(s string) bool {
 	return strings.HasPrefix(e.name, s)
 }
 
-// matches returns if the entries have the same versions.
-// If strict is false we allow signatures to mismatch.
-func (e *metaCacheEntry) matches(other *metaCacheEntry, strict bool) (prefer *metaCacheEntry, matches bool) {
+// likelyMatches returns if the entries match by comparing name and metadata length.
+func (e *metaCacheEntry) likelyMatches(other *metaCacheEntry) bool {
+	// This should reject 99%
+	if len(e.metadata) != len(other.metadata) || e.name != other.name {
+		return false
+	}
+	return true
+}
+
+// matches returns if the entries match by comparing their latest version fileinfo.
+func (e *metaCacheEntry) matches(other *metaCacheEntry, bucket string) bool {
 	if e == nil && other == nil {
-		return nil, true
+		return true
 	}
-	if e == nil {
-		return other, false
-	}
-	if other == nil {
-		return e, false
+	if e == nil || other == nil {
+		return false
 	}
 
-	// Name should match...
-	if e.name != other.name {
-		if e.name < other.name {
-			return e, false
-		}
-		return other, false
+	// This should reject 99%
+	if len(e.metadata) != len(other.metadata) || e.name != other.name {
+		return false
 	}
 
-	eVers, eErr := e.xlmeta()
-	oVers, oErr := other.xlmeta()
+	eFi, eErr := e.fileInfo(bucket)
+	oFi, oErr := other.fileInfo(bucket)
 	if eErr != nil || oErr != nil {
-		return nil, false
+		return eErr == oErr
 	}
 
-	// check both fileInfo's have same number of versions, if not skip
-	// the `other` entry.
-	if len(eVers.versions) != len(oVers.versions) {
-		eTime := eVers.latestModtime()
-		oTime := oVers.latestModtime()
-		if !eTime.Equal(oTime) {
-			if eTime.After(oTime) {
-				return e, false
-			}
-			return other, false
-		}
-		// Tiebreak on version count.
-		if len(eVers.versions) > len(oVers.versions) {
-			return e, false
-		}
-		return other, false
-	}
-
-	// Check if each version matches...
-	for i, eVer := range eVers.versions {
-		oVer := oVers.versions[i]
-		if eVer.header != oVer.header {
-			if !strict && eVer.header.matchesNotStrict(oVer.header) {
-				if prefer == nil {
-					if eVer.header.sortsBefore(oVer.header) {
-						prefer = e
-					} else {
-						prefer = other
-					}
-				}
-				continue
-			}
-			if prefer != nil {
-				return prefer, false
-			}
-
-			if eVer.header.sortsBefore(oVer.header) {
-				return e, false
-			}
-			return other, false
-		}
-	}
-	// If we match, return e
-	if prefer == nil {
-		prefer = e
-	}
-	return prefer, true
+	return eFi.ModTime.Equal(oFi.ModTime) && eFi.Size == oFi.Size && eFi.VersionID == oFi.VersionID
 }
 
 // isInDir returns whether the entry is in the dir when considering the separator.
@@ -160,69 +104,35 @@ func (e metaCacheEntry) isInDir(dir, separator string) bool {
 // If v2 and UNABLE to load metadata true will be returned.
 func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	if e.cached != nil {
-		if len(e.cached.versions) == 0 {
-			return true
-		}
-		return e.cached.versions[0].header.Type == DeleteType
+		return e.cached.Deleted
 	}
 	if !isXL2V1Format(e.metadata) {
 		return false
 	}
-	if meta, _ := isIndexedMetaV2(e.metadata); meta != nil {
-		return meta.IsLatestDeleteMarker()
-	}
-	// Fall back...
-	xlMeta, err := e.xlmeta()
-	if err != nil || len(xlMeta.versions) == 0 {
+	var xlMeta xlMetaV2
+	if err := xlMeta.Load(e.metadata); err != nil || len(xlMeta.Versions) == 0 {
 		return true
 	}
-	return xlMeta.versions[0].header.Type == DeleteType
+	return xlMeta.Versions[len(xlMeta.Versions)-1].Type == DeleteType
 }
 
 // fileInfo returns the decoded metadata.
 // If entry is a directory it is returned as that.
 // If versioned the latest version will be returned.
-func (e *metaCacheEntry) fileInfo(bucket string) (FileInfo, error) {
+func (e *metaCacheEntry) fileInfo(bucket string) (*FileInfo, error) {
 	if e.isDir() {
-		return FileInfo{
+		return &FileInfo{
 			Volume: bucket,
 			Name:   e.name,
 			Mode:   uint32(os.ModeDir),
 		}, nil
 	}
-	if e.cached != nil {
-		if len(e.cached.versions) == 0 {
-			// This special case is needed to handle xlMeta.versions == 0
-			return FileInfo{
-				Volume:   bucket,
-				Name:     e.name,
-				Deleted:  true,
-				IsLatest: true,
-				ModTime:  timeSentinel1970,
-			}, nil
-		}
-		return e.cached.ToFileInfo(bucket, e.name, "")
-	}
-	return getFileInfo(e.metadata, bucket, e.name, "", false)
-}
-
-// xlmeta returns the decoded metadata.
-// This should not be called on directories.
-func (e *metaCacheEntry) xlmeta() (*xlMetaV2, error) {
-	if e.isDir() {
-		return nil, errFileNotFound
-	}
 	if e.cached == nil {
-		if len(e.metadata) == 0 {
-			// only happens if the entry is not found.
-			return nil, errFileNotFound
-		}
-		var xl xlMetaV2
-		err := xl.LoadOrConvert(e.metadata)
+		fi, err := getFileInfo(e.metadata, bucket, e.name, "")
 		if err != nil {
 			return nil, err
 		}
-		e.cached = &xl
+		e.cached = &fi
 	}
 	return e.cached, nil
 }
@@ -243,7 +153,6 @@ func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, erro
 			},
 		}, nil
 	}
-	// Too small gains to reuse cache here.
 	return getFileInfoVersions(e.metadata, bucket, e.name)
 }
 
@@ -281,125 +190,66 @@ func (m metaCacheEntries) shallowClone() metaCacheEntries {
 }
 
 type metadataResolutionParams struct {
-	dirQuorum int // Number if disks needed for a directory to 'exist'.
-	objQuorum int // Number of disks needed for an object to 'exist'.
-
-	// An optimization request only an 'n' amount of versions from xl.meta
-	// to avoid resolving all versions to figure out the latest 'version'
-	// for ListObjects, ListObjectsV2
-	requestedVersions int
-
-	bucket string // Name of the bucket. Used for generating cached fileinfo.
-	strict bool   // Versions must match exactly, including all metadata.
-
-	// Reusable slice for resolution
-	candidates [][]xlMetaV2ShallowVersion
+	dirQuorum int    // Number if disks needed for a directory to 'exist'.
+	objQuorum int    // Number of disks needed for an object to 'exist'.
+	bucket    string // Name of the bucket. Used for generating cached fileinfo.
 }
 
-// resolve multiple entries.
-// entries are resolved by majority, then if tied by mod-time and versions.
-// Names must match on all entries in m.
 func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCacheEntry, ok bool) {
 	if len(m) == 0 {
 		return nil, false
 	}
 
 	dirExists := 0
-	if cap(r.candidates) < len(m) {
-		r.candidates = make([][]xlMetaV2ShallowVersion, 0, len(m))
-	}
-	r.candidates = r.candidates[:0]
-	objsAgree := 0
-	objsValid := 0
+	objExists := 0
+	var selFIV *FileInfo
 	for i := range m {
 		entry := &m[i]
-		// Empty entry
 		if entry.name == "" {
 			continue
 		}
-
 		if entry.isDir() {
 			dirExists++
 			selected = entry
 			continue
 		}
 
-		// Get new entry metadata,
-		// shallow decode.
-		xl, err := entry.xlmeta()
+		// Get new entry metadata
+		fiv, err := entry.fileInfo(r.bucket)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
 			continue
 		}
-		objsValid++
 
-		// Add all valid to candidates.
-		r.candidates = append(r.candidates, xl.versions)
-
-		// We select the first object we find as a candidate and see if all match that.
-		// This is to quickly identify if all agree.
-		if selected == nil {
+		objExists++
+		if selFIV == nil {
 			selected = entry
-			objsAgree = 1
+			selFIV = fiv
 			continue
 		}
-		// Names match, check meta...
-		if prefer, ok := entry.matches(selected, r.strict); ok {
-			selected = prefer
-			objsAgree++
+
+		if selected.matches(entry, r.bucket) {
 			continue
 		}
 	}
 
-	// Return dir entries, if enough...
-	if selected != nil && selected.isDir() && dirExists >= r.dirQuorum {
-		return selected, true
-	}
-
-	// If we would never be able to reach read quorum.
-	if objsValid < r.objQuorum {
+	// If directory, we need quorum.
+	if dirExists > 0 && dirExists < r.dirQuorum {
 		return nil, false
 	}
-
-	// If all objects agree.
-	if selected != nil && objsAgree == objsValid {
-		return selected, true
-	}
-
-	// If cached is nil we shall skip the entry.
-	if selected.cached == nil {
+	if objExists < r.objQuorum {
 		return nil, false
 	}
-
-	// Merge if we have disagreement.
-	// Create a new merged result.
-	selected = &metaCacheEntry{
-		name:     selected.name,
-		reusable: true,
-		cached:   &xlMetaV2{metaV: selected.cached.metaV},
-	}
-	selected.cached.versions = mergeXLV2Versions(r.objQuorum, r.strict, r.requestedVersions, r.candidates...)
-	if len(selected.cached.versions) == 0 {
-		return nil, false
-	}
-
-	// Reserialize
-	var err error
-	selected.metadata, err = selected.cached.AppendTo(metaDataPoolGet())
-	if err != nil {
-		logger.LogIf(context.Background(), err)
-		return nil, false
-	}
-	return selected, true
+	// Take the latest selected.
+	return selected, selected != nil
 }
 
 // firstFound returns the first found and the number of set entries.
 func (m metaCacheEntries) firstFound() (first *metaCacheEntry, n int) {
-	for i, entry := range m {
+	for _, entry := range m {
 		if entry.name != "" {
 			n++
 			if first == nil {
-				first = &m[i]
+				first = &entry
 			}
 		}
 	}
@@ -421,8 +271,16 @@ type metaCacheEntriesSorted struct {
 	o metaCacheEntries
 	// list id is not serialized
 	listID string
-	// Reuse buffers
-	reuse bool
+}
+
+// writeTo will write all objects to the provided output.
+func (m metaCacheEntriesSorted) writeTo(writer io.Writer) error {
+	w := newMetacacheWriter(writer, 1<<20)
+	if err := w.write(m.o...); err != nil {
+		w.Close()
+		return err
+	}
+	return w.Close()
 }
 
 // shallowClone will create a shallow clone of the array objects,
@@ -431,6 +289,19 @@ func (m metaCacheEntriesSorted) shallowClone() metaCacheEntriesSorted {
 	// We have value receiver so we already have a copy.
 	m.o = m.o.shallowClone()
 	return m
+}
+
+// iterate the entries in order.
+// If the iterator function returns iterating stops.
+func (m *metaCacheEntriesSorted) iterate(fn func(entry metaCacheEntry) (cont bool)) {
+	if m == nil {
+		return
+	}
+	for _, o := range m.o {
+		if !fn(o) {
+			return
+		}
+	}
 }
 
 // fileInfoVersions converts the metadata to FileInfoVersions where possible.
@@ -504,7 +375,7 @@ func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, aft
 	return versions
 }
 
-// fileInfos converts the metadata to ObjectInfo where possible.
+// fileInfoVersions converts the metadata to FileInfoVersions where possible.
 // Metadata that cannot be decoded is skipped.
 func (m *metaCacheEntriesSorted) fileInfos(bucket, prefix, delimiter string) (objects []ObjectInfo) {
 	objects = make([]ObjectInfo, 0, m.len())
@@ -568,134 +439,7 @@ func (m *metaCacheEntriesSorted) forwardTo(s string) {
 	idx := sort.Search(len(m.o), func(i int) bool {
 		return m.o[i].name >= s
 	})
-	if m.reuse {
-		for i, entry := range m.o[:idx] {
-			metaDataPoolPut(entry.metadata)
-			m.o[i].metadata = nil
-		}
-	}
-
 	m.o = m.o[idx:]
-}
-
-// forwardPast will truncate m so only entries that are after s is in the list.
-func (m *metaCacheEntriesSorted) forwardPast(s string) {
-	if s == "" {
-		return
-	}
-	idx := sort.Search(len(m.o), func(i int) bool {
-		return m.o[i].name > s
-	})
-	if m.reuse {
-		for i, entry := range m.o[:idx] {
-			metaDataPoolPut(entry.metadata)
-			m.o[i].metadata = nil
-		}
-	}
-	m.o = m.o[idx:]
-}
-
-// mergeEntryChannels will merge entries from in and return them sorted on out.
-// To signify no more results are on an input channel, close it.
-// The output channel will be closed when all inputs are emptied.
-// If file names are equal, compareMeta is called to select which one to choose.
-// The entry not chosen will be discarded.
-// If the context is canceled the function will return the error,
-// otherwise the function will return nil.
-func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, compareMeta func(existing, other *metaCacheEntry) (replace bool)) error {
-	defer close(out)
-	top := make([]*metaCacheEntry, len(in))
-	nDone := 0
-	ctxDone := ctx.Done()
-
-	// Use simpler forwarder.
-	if len(in) == 1 {
-		for {
-			select {
-			case <-ctxDone:
-				return ctx.Err()
-			case v, ok := <-in[0]:
-				if !ok {
-					return nil
-				}
-				select {
-				case <-ctxDone:
-					return ctx.Err()
-				case out <- v:
-				}
-			}
-		}
-	}
-
-	selectFrom := func(idx int) error {
-		select {
-		case <-ctxDone:
-			return ctx.Err()
-		case entry, ok := <-in[idx]:
-			if !ok {
-				top[idx] = nil
-				nDone++
-			} else {
-				top[idx] = &entry
-			}
-		}
-		return nil
-	}
-	// Populate all...
-	for i := range in {
-		if err := selectFrom(i); err != nil {
-			return err
-		}
-	}
-	last := ""
-
-	// Choose the best to return.
-	for {
-		if nDone == len(in) {
-			return nil
-		}
-		best := top[0]
-		bestIdx := 0
-		for i, other := range top[1:] {
-			otherIdx := i + 1
-			if other == nil {
-				continue
-			}
-			if best == nil {
-				best = other
-				bestIdx = otherIdx
-				continue
-			}
-			if best.name == other.name {
-				if compareMeta(best, other) {
-					// Replace "best"
-					if err := selectFrom(bestIdx); err != nil {
-						return err
-					}
-					best = other
-					bestIdx = otherIdx
-				} else if err := selectFrom(otherIdx); err != nil {
-					// Keep best, replace "other"
-					return err
-				}
-				continue
-			}
-			if best.name > other.name {
-				best = other
-				bestIdx = otherIdx
-			}
-		}
-		if best.name > last {
-			out <- *best
-			last = best.name
-		} else if serverDebugLog {
-			console.Debugln("mergeEntryChannels: discarding duplicate", best.name, "<=", last)
-		}
-		// Replace entry we just sent.
-		if err := selectFrom(bestIdx); err != nil {
-			return err
-		}
-	}
 }
 
 // merge will merge other into m.
@@ -729,6 +473,17 @@ func (m *metaCacheEntriesSorted) merge(other metaCacheEntriesSorted, limit int) 
 		merged = append(merged, b...)
 	}
 	m.o = merged
+}
+
+// filter allows selective filtering with the provided function.
+func (m *metaCacheEntriesSorted) filter(fn func(entry *metaCacheEntry) bool) {
+	dst := m.o[:0]
+	for _, o := range m.o {
+		if fn(&o) {
+			dst = append(dst, o)
+		}
+	}
+	m.o = dst
 }
 
 // filterPrefix will filter m to only contain entries with the specified prefix.
@@ -802,12 +557,6 @@ func (m *metaCacheEntriesSorted) truncate(n int) {
 		return
 	}
 	if len(m.o) > n {
-		if m.reuse {
-			for i, entry := range m.o[n:] {
-				metaDataPoolPut(entry.metadata)
-				m.o[n+i].metadata = nil
-			}
-		}
 		m.o = m.o[:n]
 	}
 }
@@ -826,4 +575,45 @@ func (m *metaCacheEntriesSorted) entries() metaCacheEntries {
 		return nil
 	}
 	return m.o
+}
+
+// deduplicate entries in the list.
+// If compareMeta is set it will be used to resolve conflicts.
+// The function should return whether the existing entry should be replaced with other.
+// If no compareMeta is provided duplicates may be left.
+// This is indicated by the returned boolean.
+func (m *metaCacheEntriesSorted) deduplicate(compareMeta func(existing, other *metaCacheEntry) (replace bool)) (dupesLeft bool) {
+	dst := m.o[:0]
+	for j := range m.o {
+		found := false
+		obj := &m.o[j]
+		for i := len(dst) - 1; i >= 0; i++ {
+			existing := &dst[i]
+			if existing.name != obj.name {
+				break
+			}
+
+			// Use given resolution function first if any.
+			if compareMeta != nil {
+				if compareMeta(existing, obj) {
+					dst[i] = *obj
+				}
+				found = true
+				break
+			}
+			if obj.likelyMatches(existing) {
+				found = true
+				break
+			}
+
+			// Matches, move on.
+			dupesLeft = true
+			continue
+		}
+		if !found {
+			dst = append(dst, *obj)
+		}
+	}
+	m.o = dst
+	return dupesLeft
 }

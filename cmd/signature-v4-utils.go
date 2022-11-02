@@ -1,26 +1,24 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"bytes"
 	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"io/ioutil"
@@ -28,9 +26,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/minio/minio/internal/auth"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/sha256-simd"
 )
 
 // http Header "x-amz-content-sha256" == "UNSIGNED-PAYLOAD" indicates that the
@@ -46,7 +45,7 @@ func skipContentSha256Cksum(r *http.Request) bool {
 	)
 
 	if isRequestPresignedSignatureV4(r) {
-		v, ok = r.Form[xhttp.AmzContentSha256]
+		v, ok = r.URL.Query()[xhttp.AmzContentSha256]
 		if !ok {
 			v, ok = r.Header[xhttp.AmzContentSha256]
 		}
@@ -54,30 +53,9 @@ func skipContentSha256Cksum(r *http.Request) bool {
 		v, ok = r.Header[xhttp.AmzContentSha256]
 	}
 
-	// Skip if no header was set.
-	if !ok {
-		return true
-	}
-
 	// If x-amz-content-sha256 is set and the value is not
 	// 'UNSIGNED-PAYLOAD' we should validate the content sha256.
-	switch v[0] {
-	case unsignedPayload:
-		return true
-	case emptySHA256:
-		// some broken clients set empty-sha256
-		// with > 0 content-length in the body,
-		// we should skip such clients and allow
-		// blindly such insecure clients only if
-		// S3 strict compatibility is disabled.
-		if r.ContentLength > 0 && !globalCLIContext.StrictS3Compat {
-			// We return true only in situations when
-			// deployment has asked MinIO to allow for
-			// such broken clients and content-length > 0.
-			return true
-		}
-	}
-	return false
+	return !(ok && v[0] != unsignedPayload)
 }
 
 // Returns SHA256 for calculating canonical-request.
@@ -87,9 +65,10 @@ func getContentSha256Cksum(r *http.Request, stype serviceType) string {
 		if err != nil {
 			logger.CriticalIf(GlobalContext, err)
 		}
-		sum256 := sha256.Sum256(payload)
+		sum256 := sha256.New()
+		sum256.Write(payload)
 		r.Body = ioutil.NopCloser(bytes.NewReader(payload))
-		return hex.EncodeToString(sum256[:])
+		return hex.EncodeToString(sum256.Sum(nil))
 	}
 
 	var (
@@ -103,7 +82,7 @@ func getContentSha256Cksum(r *http.Request, stype serviceType) string {
 		// X-Amz-Content-Sha256, if not set in presigned requests, checksum
 		// will default to 'UNSIGNED-PAYLOAD'.
 		defaultSha256Cksum = unsignedPayload
-		v, ok = r.Form[xhttp.AmzContentSha256]
+		v, ok = r.URL.Query()[xhttp.AmzContentSha256]
 		if !ok {
 			v, ok = r.Header[xhttp.AmzContentSha256]
 		}
@@ -141,36 +120,17 @@ func isValidRegion(reqRegion string, confRegion string) bool {
 
 // check if the access key is valid and recognized, additionally
 // also returns if the access key is owner/admin.
-func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, APIErrorCode) {
-	if !globalIAMSys.Initialized() && !globalIsGateway {
-		// Check if server has initialized, then only proceed
-		// to check for IAM users otherwise its okay for clients
-		// to retry with 503 errors when server is coming up.
-		return auth.Credentials{}, false, ErrServerNotInitialized
-	}
-
-	cred := globalActiveCred
+func checkKeyValid(accessKey string) (auth.Credentials, bool, APIErrorCode) {
+	var owner = true
+	var cred = globalActiveCred
 	if cred.AccessKey != accessKey {
 		// Check if the access key is part of users credentials.
-		ucred, ok := globalIAMSys.GetUser(r.Context(), accessKey)
-		if !ok {
-			// Credentials will be invalid but and disabled
-			// return a different error in such a scenario.
-			if ucred.Status == auth.AccountOff {
-				return cred, false, ErrAccessKeyDisabled
-			}
+		var ok bool
+		if cred, ok = globalIAMSys.GetUser(accessKey); !ok {
 			return cred, false, ErrInvalidAccessKeyID
 		}
-		cred = ucred
+		owner = false
 	}
-
-	claims, s3Err := checkClaimsFromToken(r, cred)
-	if s3Err != ErrNone {
-		return cred, false, s3Err
-	}
-	cred.Claims = claims
-
-	owner := cred.AccessKey == globalActiveCred.AccessKey
 	return cred, owner, ErrNone
 }
 
@@ -184,7 +144,7 @@ func sumHMAC(key []byte, data []byte) []byte {
 // extractSignedHeaders extract signed headers from Authorization header
 func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header, APIErrorCode) {
 	reqHeaders := r.Header
-	reqQueries := r.Form
+	reqQueries := r.URL.Query()
 	// find whether "host" is part of list of signed headers.
 	// if not return ErrUnsignedHeaders. "host" is mandatory.
 	if !contains(signedHeaders, "host") {

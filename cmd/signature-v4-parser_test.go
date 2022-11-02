@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -37,8 +36,7 @@ func joinWithSlash(accessKey, date, region, service, requestVersion string) stri
 		date,
 		region,
 		service,
-		requestVersion,
-	}, SlashSeparator)
+		requestVersion}, SlashSeparator)
 }
 
 // generate CredentialHeader from its fields.
@@ -60,6 +58,7 @@ func generateCredentials(t *testing.T, accessKey string, date string, region, se
 
 // validates the credential fields against the expected credential.
 func validateCredentialfields(t *testing.T, testNum int, expectedCredentials credentialHeader, actualCredential credentialHeader) {
+
 	if expectedCredentials.accessKey != actualCredential.accessKey {
 		t.Errorf("Test %d: AccessKey mismatch: Expected \"%s\", got \"%s\"", testNum, expectedCredentials.accessKey, actualCredential.accessKey)
 	}
@@ -87,6 +86,7 @@ func validateCredentialfields(t *testing.T, testNum int, expectedCredentials cre
 //		        "aws4_request",
 //                       },SlashSeparator)
 func TestParseCredentialHeader(t *testing.T) {
+
 	sampleTimeStr := UTCNow().Format(yyyymmdd)
 
 	testCases := []struct {
@@ -295,6 +295,7 @@ func TestParseSignature(t *testing.T) {
 		if actualErrCode == ErrNone {
 			if testCase.expectedSignStr != actualSignStr {
 				t.Errorf("Test %d: Expected the result to be \"%s\", but got \"%s\". ", i+1, testCase.expectedSignStr, actualSignStr)
+
 			}
 		}
 
@@ -340,6 +341,7 @@ func TestParseSignedHeaders(t *testing.T) {
 		if actualErrCode == ErrNone {
 			if strings.Join(testCase.expectedSignedHeaders, ",") != strings.Join(actualSignedHeaders, ",") {
 				t.Errorf("Test %d: Expected the result to be \"%v\", but got \"%v\". ", i+1, testCase.expectedSignedHeaders, actualSignedHeaders)
+
 			}
 		}
 
@@ -515,6 +517,7 @@ func TestParseSignV4(t *testing.T) {
 		}
 
 	}
+
 }
 
 // TestDoesV4PresignParamsExist - tests validate the logic to
@@ -615,6 +618,7 @@ func TestDoesV4PresignParamsExist(t *testing.T) {
 		inputQuery := url.Values{}
 		// iterating through input query key value and setting the inputQuery of type url.Values.
 		for j := 0; j < len(testCase.inputQueryKeyVals)-1; j += 2 {
+
 			inputQuery.Set(testCase.inputQueryKeyVals[j], testCase.inputQueryKeyVals[j+1])
 		}
 
@@ -624,6 +628,7 @@ func TestDoesV4PresignParamsExist(t *testing.T) {
 			t.Fatalf("Test %d: Expected the APIErrCode to be %d, got %d", i+1, testCase.expectedErrCode, actualErrCode)
 		}
 	}
+
 }
 
 // TestParsePreSignV4 - Validates the parsing logic of Presignied v4 request from its url query values.
@@ -662,6 +667,7 @@ func TestParsePreSignV4(t *testing.T) {
 		// The other query params should exist, other wise ErrInvalidQueryParams will be returned because of missing fields.
 		{
 			inputQueryKeyVals: []string{
+
 				"X-Amz-Algorithm", "InvalidValue",
 				"X-Amz-Credential", "",
 				"X-Amz-Signature", "",

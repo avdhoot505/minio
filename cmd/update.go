@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2015-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -35,11 +34,12 @@ import (
 	"strings"
 	"time"
 
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
-	xnet "github.com/minio/pkg/net"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/env"
+	xnet "github.com/minio/minio/pkg/net"
 	"github.com/minio/selfupdate"
+	_ "github.com/minio/sha256-simd" // Needed for sha256 hash verifier.
 )
 
 const (
@@ -51,8 +51,13 @@ const (
 	updateTimeout     = 10 * time.Second
 )
 
-// For windows our files have .exe additionally.
-var minioReleaseWindowsInfoURL = minioReleaseURL + "minio.exe.sha256sum"
+var (
+	// Newer official download info URLs appear earlier below.
+	minioReleaseInfoURL = minioReleaseURL + "minio.sha256sum"
+
+	// For windows our files have .exe additionally.
+	minioReleaseWindowsInfoURL = minioReleaseURL + "minio.exe.sha256sum"
+)
 
 // minioVersionToReleaseTime - parses a standard official release
 // MinIO version string.
@@ -124,7 +129,7 @@ func GetCurrentReleaseTime() (releaseTime time.Time, err error) {
 //     "/.dockerenv":      "file",
 //
 func IsDocker() bool {
-	if !globalIsCICD {
+	if env.Get("MINIO_CI_CD", "") == "" {
 		_, err := os.Stat("/.dockerenv")
 		if osIsNotExist(err) {
 			return false
@@ -140,7 +145,7 @@ func IsDocker() bool {
 
 // IsDCOS returns true if minio is running in DCOS.
 func IsDCOS() bool {
-	if !globalIsCICD {
+	if env.Get("MINIO_CI_CD", "") == "" {
 		// http://mesos.apache.org/documentation/latest/docker-containerizer/
 		// Mesos docker containerizer sets this value
 		return env.Get("MESOS_CONTAINER_NAME", "") != ""
@@ -148,9 +153,14 @@ func IsDCOS() bool {
 	return false
 }
 
+// IsKubernetesReplicaSet returns true if minio is running in kubernetes replica set.
+func IsKubernetesReplicaSet() bool {
+	return IsKubernetes() && (env.Get("KUBERNETES_REPLICA_SET", "") != "")
+}
+
 // IsKubernetes returns true if minio is running in kubernetes.
 func IsKubernetes() bool {
-	if !globalIsCICD {
+	if env.Get("MINIO_CI_CD", "") == "" {
 		// Kubernetes env used to validate if we are
 		// indeed running inside a kubernetes pod
 		// is KUBERNETES_SERVICE_HOST
@@ -210,11 +220,6 @@ func IsSourceBuild() bool {
 	return err != nil
 }
 
-// IsPCFTile returns if server is running in PCF
-func IsPCFTile() bool {
-	return env.Get("MINIO_PCF_TILE_VERSION", "") != ""
-}
-
 // DO NOT CHANGE USER AGENT STYLE.
 // The style should be
 //
@@ -223,6 +228,7 @@ func IsPCFTile() bool {
 // Any change here should be discussed by opening an issue at
 // https://github.com/minio/minio/issues.
 func getUserAgent(mode string) string {
+
 	userAgentParts := []string{}
 	// Helper function to concisely append a pair of strings to a
 	// the user-agent slice.
@@ -279,11 +285,9 @@ func getUserAgent(mode string) string {
 		}
 	}
 
-	if IsPCFTile() {
-		pcfTileVersion := env.Get("MINIO_PCF_TILE_VERSION", "")
-		if pcfTileVersion != "" {
-			uaAppend(" MinIO/pcf-tile-", pcfTileVersion)
-		}
+	pcfTileVersion := env.Get("MINIO_PCF_TILE_VERSION", "")
+	if pcfTileVersion != "" {
+		uaAppend(" MinIO/pcf-tile-", pcfTileVersion)
 	}
 
 	return strings.Join(userAgentParts, "")
@@ -366,7 +370,7 @@ func downloadReleaseURL(u *url.URL, timeout time.Duration, mode string) (content
 // fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z.<hotfix_optional>
 //
 // The second word must be `minio.` appended to a standard release tag.
-func parseReleaseData(data string) (sha256Sum []byte, releaseTime time.Time, releaseInfo string, err error) {
+func parseReleaseData(data string) (sha256Sum []byte, releaseTime time.Time, err error) {
 	defer func() {
 		if err != nil {
 			err = AdminError{
@@ -380,25 +384,25 @@ func parseReleaseData(data string) (sha256Sum []byte, releaseTime time.Time, rel
 	fields := strings.Fields(data)
 	if len(fields) != 2 {
 		err = fmt.Errorf("Unknown release data `%s`", data)
-		return sha256Sum, releaseTime, releaseInfo, err
+		return sha256Sum, releaseTime, err
 	}
 
 	sha256Sum, err = hex.DecodeString(fields[0])
 	if err != nil {
-		return sha256Sum, releaseTime, releaseInfo, err
+		return sha256Sum, releaseTime, err
 	}
 
-	releaseInfo = fields[1]
+	releaseInfo := fields[1]
 
 	// Split release of style minio.RELEASE.2019-08-21T19-40-07Z.<hotfix>
 	nfields := strings.SplitN(releaseInfo, ".", 2)
 	if len(nfields) != 2 {
 		err = fmt.Errorf("Unknown release information `%s`", releaseInfo)
-		return sha256Sum, releaseTime, releaseInfo, err
+		return sha256Sum, releaseTime, err
 	}
 	if nfields[0] != "minio" {
 		err = fmt.Errorf("Unknown release `%s`", releaseInfo)
-		return sha256Sum, releaseTime, releaseInfo, err
+		return sha256Sum, releaseTime, err
 	}
 
 	releaseTime, err = releaseTagToReleaseTime(nfields[1])
@@ -406,7 +410,7 @@ func parseReleaseData(data string) (sha256Sum []byte, releaseTime time.Time, rel
 		err = fmt.Errorf("Unknown release tag format. %w", err)
 	}
 
-	return sha256Sum, releaseTime, releaseInfo, err
+	return sha256Sum, releaseTime, err
 }
 
 func getUpdateTransport(timeout time.Duration) http.RoundTripper {
@@ -417,8 +421,7 @@ func getUpdateTransport(timeout time.Duration) http.RoundTripper {
 		TLSHandshakeTimeout:   timeout,
 		ExpectContinueTimeout: timeout,
 		TLSClientConfig: &tls.Config{
-			RootCAs:            globalRootCAs,
-			ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
+			RootCAs: globalRootCAs,
 		},
 		DisableCompression: true,
 	}
@@ -431,8 +434,7 @@ func getLatestReleaseTime(u *url.URL, timeout time.Duration, mode string) (sha25
 		return sha256Sum, releaseTime, err
 	}
 
-	sha256Sum, releaseTime, _, err = parseReleaseData(data)
-	return
+	return parseReleaseData(data)
 }
 
 const (
@@ -459,7 +461,7 @@ func getDownloadURL(releaseTag string) (downloadURL string) {
 	// Check if we are docker environment, return docker update command
 	if IsDocker() {
 		// Construct release tag name.
-		return fmt.Sprintf("podman pull quay.io/minio/minio:%s", releaseTag)
+		return fmt.Sprintf("docker pull minio/minio:%s", releaseTag)
 	}
 
 	// For binary only installations, we return link to the latest binary.
@@ -515,7 +517,7 @@ func getUpdateReaderFromURL(u *url.URL, transport http.RoundTripper, mode string
 	return resp.Body, nil
 }
 
-func doUpdate(u *url.URL, lrTime time.Time, sha256Sum []byte, releaseInfo string, mode string) (err error) {
+func doUpdate(u *url.URL, lrTime time.Time, sha256Sum []byte, mode string) (err error) {
 	transport := getUpdateTransport(30 * time.Second)
 	var reader io.ReadCloser
 	if u.Scheme == "https" || u.Scheme == "http" {
@@ -535,18 +537,10 @@ func doUpdate(u *url.URL, lrTime time.Time, sha256Sum []byte, releaseInfo string
 		Checksum: sha256Sum,
 	}
 
-	if err := opts.CheckPermissions(); err != nil {
-		return AdminError{
-			Code:       AdminUpdateApplyFailure,
-			Message:    fmt.Sprintf("server update failed with: %s, do not restart the servers yet", err),
-			StatusCode: http.StatusInternalServerError,
-		}
-	}
-
 	minisignPubkey := env.Get(envMinisignPubKey, "")
 	if minisignPubkey != "" {
 		v := selfupdate.NewVerifier()
-		u.Path = path.Dir(u.Path) + slashSeparator + releaseInfo + ".minisig"
+		u.Path = path.Dir(u.Path) + slashSeparator + "minio.RELEASE." + lrTime.Format(minioReleaseTagTimeLayout) + ".minisig"
 		if err = v.LoadFromURL(u.String(), minisignPubkey, transport); err != nil {
 			return AdminError{
 				Code:       AdminUpdateApplyFailure,

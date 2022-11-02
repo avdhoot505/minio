@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -141,15 +140,13 @@ func TestTreeWalk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
-	defer os.RemoveAll(fsDir)
-
 	endpoints := mustGetNewEndpoints(fsDir)
 	disk, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Fatalf("Unable to create StorageAPI: %s", err)
 	}
 
-	files := []string{
+	var files = []string{
 		"d/e",
 		"d/f",
 		"d/g/h",
@@ -177,6 +174,11 @@ func TestTreeWalk(t *testing.T) {
 
 	// Simple test when marker is set.
 	testTreeWalkMarker(t, listDir, isLeaf, isLeafDir)
+
+	err = os.RemoveAll(fsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Test if tree walk go-routine exits cleanly if tree walk is aborted because of timeout.
@@ -185,7 +187,6 @@ func TestTreeWalkTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
-	defer os.RemoveAll(fsDir)
 	endpoints := mustGetNewEndpoints(fsDir)
 	disk, err := newStorageAPI(endpoints[0])
 	if err != nil {
@@ -248,6 +249,10 @@ func TestTreeWalkTimeout(t *testing.T) {
 	if ok {
 		t.Error("Tree-walk go routine has not exited after timeout.")
 	}
+	err = os.RemoveAll(fsDir)
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 // TestRecursiveWalk - tests if treeWalk returns entries correctly with and
@@ -258,7 +263,6 @@ func TestRecursiveTreeWalk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
-	defer os.RemoveAll(fsDir1)
 
 	endpoints := mustGetNewEndpoints(fsDir1)
 	disk1, err := newStorageAPI(endpoints[0])
@@ -279,7 +283,7 @@ func TestRecursiveTreeWalk(t *testing.T) {
 	listDir := listDirFactory(context.Background(), disk1, isLeaf)
 
 	// Create the namespace.
-	files := []string{
+	var files = []string{
 		"d/e",
 		"d/f",
 		"d/g/h",
@@ -361,6 +365,10 @@ func TestRecursiveTreeWalk(t *testing.T) {
 			}
 		})
 	}
+	err = os.RemoveAll(fsDir1)
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func TestSortedness(t *testing.T) {
@@ -369,7 +377,6 @@ func TestSortedness(t *testing.T) {
 	if err != nil {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
-	defer os.RemoveAll(fsDir1)
 
 	endpoints := mustGetNewEndpoints(fsDir1)
 	disk1, err := newStorageAPI(endpoints[0])
@@ -390,7 +397,7 @@ func TestSortedness(t *testing.T) {
 	listDir := listDirFactory(context.Background(), disk1, isLeaf)
 
 	// Create the namespace.
-	files := []string{
+	var files = []string{
 		"d/e",
 		"d/f",
 		"d/g/h",
@@ -436,6 +443,12 @@ func TestSortedness(t *testing.T) {
 			t.Error(i+1, "Expected entries to be sort, but it wasn't")
 		}
 	}
+
+	// Remove directory created for testing
+	err = os.RemoveAll(fsDir1)
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func TestTreeWalkIsEnd(t *testing.T) {
@@ -444,7 +457,6 @@ func TestTreeWalkIsEnd(t *testing.T) {
 	if err != nil {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
-	defer os.RemoveAll(fsDir1)
 
 	endpoints := mustGetNewEndpoints(fsDir1)
 	disk1, err := newStorageAPI(endpoints[0])
@@ -465,7 +477,7 @@ func TestTreeWalkIsEnd(t *testing.T) {
 	listDir := listDirFactory(context.Background(), disk1, isLeaf)
 
 	// Create the namespace.
-	files := []string{
+	var files = []string{
 		"d/e",
 		"d/f",
 		"d/g/h",
@@ -512,5 +524,11 @@ func TestTreeWalkIsEnd(t *testing.T) {
 		if !entry.end {
 			t.Errorf("Test %d: Last entry %s, doesn't have EOF marker set", i, entry.entry)
 		}
+	}
+
+	// Remove directory created for testing
+	err = os.RemoveAll(fsDir1)
+	if err != nil {
+		t.Error(err)
 	}
 }

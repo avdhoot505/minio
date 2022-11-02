@@ -1,42 +1,39 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"path"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/config"
-	"github.com/minio/minio/internal/kms"
+	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 const (
 	minioConfigPrefix = "config"
-	minioConfigBucket = minioMetaBucket + SlashSeparator + minioConfigPrefix
-	kvPrefix          = ".kv"
+
+	kvPrefix = ".kv"
 
 	// Captures all the previous SetKV operations and allows rollback.
 	minioConfigHistoryPrefix = minioConfigPrefix + "/history"
@@ -46,8 +43,8 @@ const (
 )
 
 func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData bool, count int) (
-	[]madmin.ConfigHistoryEntry, error,
-) {
+	[]madmin.ConfigHistoryEntry, error) {
+
 	var configHistory []madmin.ConfigHistoryEntry
 
 	// List all kvs
@@ -67,10 +64,8 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 				if err != nil {
 					return nil, err
 				}
-				if GlobalKMS != nil {
-					data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-						obj.Bucket: path.Join(obj.Bucket, obj.Name),
-					})
+				if globalConfigEncrypted && !utf8.Valid(data) {
+					data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 					if err != nil {
 						return nil, err
 					}
@@ -97,9 +92,7 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 
 func delServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV string) error {
 	historyFile := pathJoin(minioConfigHistoryPrefix, uuidKV+kvPrefix)
-	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, historyFile, ObjectOptions{
-		DeletePrefix: true,
-	})
+	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, historyFile, ObjectOptions{})
 	return err
 }
 
@@ -110,11 +103,10 @@ func readServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV str
 		return nil, err
 	}
 
-	if GlobalKMS != nil {
-		data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-			minioMetaBucket: path.Join(minioMetaBucket, historyFile),
-		})
+	if globalConfigEncrypted && !utf8.Valid(data) {
+		data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 	}
+
 	return data, err
 }
 
@@ -122,60 +114,61 @@ func saveServerConfigHistory(ctx context.Context, objAPI ObjectLayer, kv []byte)
 	uuidKV := mustGetUUID() + kvPrefix
 	historyFile := pathJoin(minioConfigHistoryPrefix, uuidKV)
 
-	if GlobalKMS != nil {
-		var err error
-		kv, err = config.EncryptBytes(GlobalKMS, kv, kms.Context{
-			minioMetaBucket: path.Join(minioMetaBucket, historyFile),
-		})
+	var err error
+	if globalConfigEncrypted {
+		kv, err = madmin.EncryptData(globalActiveCred.String(), kv)
 		if err != nil {
 			return err
 		}
 	}
+
+	// Save the new config KV settings into the history path.
 	return saveConfig(ctx, objAPI, historyFile, kv)
 }
 
-func saveServerConfig(ctx context.Context, objAPI ObjectLayer, cfg interface{}) error {
-	data, err := json.Marshal(cfg)
+func saveServerConfig(ctx context.Context, objAPI ObjectLayer, config interface{}) error {
+	data, err := json.Marshal(config)
 	if err != nil {
 		return err
 	}
 
-	configFile := path.Join(minioConfigPrefix, minioConfigFile)
-	if GlobalKMS != nil {
-		data, err = config.EncryptBytes(GlobalKMS, data, kms.Context{
-			minioMetaBucket: path.Join(minioMetaBucket, configFile),
-		})
+	if globalConfigEncrypted {
+		data, err = madmin.EncryptData(globalActiveCred.String(), data)
 		if err != nil {
 			return err
 		}
 	}
+
+	configFile := path.Join(minioConfigPrefix, minioConfigFile)
+	// Save the new config in the std config path
 	return saveConfig(ctx, objAPI, configFile, data)
 }
 
 func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, error) {
-	srvCfg := config.New()
 	configFile := path.Join(minioConfigPrefix, minioConfigFile)
-	data, err := readConfig(ctx, objAPI, configFile)
+	configData, err := readConfig(ctx, objAPI, configFile)
 	if err != nil {
-		if errors.Is(err, errConfigNotFound) {
-			lookupConfigs(srvCfg, objAPI)
-			return srvCfg, nil
+		// Config not found for some reason, allow things to continue
+		// by initializing a new fresh config in safe mode.
+		if err == errConfigNotFound && newObjectLayerFn() == nil {
+			return newServerConfig(), nil
 		}
 		return nil, err
 	}
 
-	if GlobalKMS != nil && !utf8.Valid(data) {
-		data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-			minioMetaBucket: path.Join(minioMetaBucket, configFile),
-		})
+	if globalConfigEncrypted && !utf8.Valid(configData) {
+		configData, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(configData))
 		if err != nil {
-			lookupConfigs(srvCfg, objAPI)
+			if err == madmin.ErrMaliciousData {
+				return nil, config.ErrInvalidCredentialsBackendEncrypted(nil)
+			}
 			return nil, err
 		}
 	}
 
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(data, &srvCfg); err != nil {
+	var srvCfg = config.New()
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(configData, &srvCfg); err != nil {
 		return nil, err
 	}
 
@@ -185,6 +178,11 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, e
 
 // ConfigSys - config system.
 type ConfigSys struct{}
+
+// Load - load config.json.
+func (sys *ConfigSys) Load(objAPI ObjectLayer) error {
+	return sys.Init(objAPI)
+}
 
 // Init - initializes config system from config.json.
 func (sys *ConfigSys) Init(objAPI ObjectLayer) error {
@@ -218,18 +216,18 @@ func initConfig(objAPI ObjectLayer) error {
 	// If etcd is set then migrates /config/config.json
 	// to '<export_path>/.minio.sys/config/config.json'
 	if err := migrateConfigToMinioSys(objAPI); err != nil {
-		return fmt.Errorf("migrateConfigToMinioSys: %w", err)
+		return err
 	}
 
 	// Migrates backend '<export_path>/.minio.sys/config/config.json' to latest version.
 	if err := migrateMinioSysConfig(objAPI); err != nil {
-		return fmt.Errorf("migrateMinioSysConfig: %w", err)
+		return err
 	}
 
 	// Migrates backend '<export_path>/.minio.sys/config/config.json' to
 	// latest config format.
 	if err := migrateMinioSysConfigToKV(objAPI); err != nil {
-		return fmt.Errorf("migrateMinioSysConfigToKV: %w", err)
+		return err
 	}
 
 	return loadConfig(objAPI)

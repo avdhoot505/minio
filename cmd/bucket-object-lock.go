@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2019-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -22,12 +21,12 @@ import (
 	"math"
 	"net/http"
 
-	"github.com/minio/minio/internal/auth"
-	objectlock "github.com/minio/minio/internal/bucket/object/lock"
-	"github.com/minio/minio/internal/bucket/replication"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
+	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
+	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/replication"
 )
 
 // BucketObjectLockSys - map of bucket and retention configuration.
@@ -58,10 +57,6 @@ func (sys *BucketObjectLockSys) Get(bucketName string) (r objectlock.Retention, 
 // enforceRetentionForDeletion checks if it is appropriate to remove an
 // object according to locking configuration when this is lifecycle/ bucket quota asking.
 func enforceRetentionForDeletion(ctx context.Context, objInfo ObjectInfo) (locked bool) {
-	if objInfo.DeleteMarker {
-		return false
-	}
-
 	lhold := objectlock.GetObjectLegalHoldMeta(objInfo.UserDefined)
 	if lhold.Status.Valid() && lhold.Status == objectlock.LegalHoldOn {
 		return true
@@ -97,7 +92,7 @@ func enforceRetentionBypassForDelete(ctx context.Context, r *http.Request, bucke
 	if gerr != nil { // error from GetObjectInfo
 		switch gerr.(type) {
 		case MethodNotAllowed: // This happens usually for a delete marker
-			if oi.DeleteMarker || !oi.VersionPurgeStatus.Empty() {
+			if oi.DeleteMarker {
 				// Delete marker should be present and valid.
 				return ErrNone
 			}
@@ -179,76 +174,68 @@ func enforceRetentionBypassForDelete(ctx context.Context, r *http.Request, bucke
 // For objects in "Governance" mode, overwrite is allowed if a) object retention date is past OR
 // governance bypass headers are set and user has governance bypass permissions.
 // Objects in compliance mode can be overwritten only if retention date is being extended. No mode change is permitted.
-func enforceRetentionBypassForPut(ctx context.Context, r *http.Request, oi ObjectInfo, objRetention *objectlock.ObjectRetention, cred auth.Credentials, owner bool) error {
+func enforceRetentionBypassForPut(ctx context.Context, r *http.Request, bucket, object string, getObjectInfoFn GetObjectInfoFn, objRetention *objectlock.ObjectRetention, cred auth.Credentials, owner bool, claims map[string]interface{}) (ObjectInfo, APIErrorCode) {
 	byPassSet := objectlock.IsObjectLockGovernanceBypassSet(r.Header)
+	opts, err := getOpts(ctx, r, bucket, object)
+	if err != nil {
+		return ObjectInfo{}, toAPIErrorCode(ctx, err)
+	}
+
+	oi, err := getObjectInfoFn(ctx, bucket, object, opts)
+	if err != nil {
+		return oi, toAPIErrorCode(ctx, err)
+	}
 
 	t, err := objectlock.UTCNowNTP()
 	if err != nil {
 		logger.LogIf(ctx, err)
-		return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
+		return oi, ErrObjectLocked
 	}
 
-	// Pass in relative days from current time, to additionally
-	// to verify "object-lock-remaining-retention-days" policy if any.
+	// Pass in relative days from current time, to additionally to verify "object-lock-remaining-retention-days" policy if any.
 	days := int(math.Ceil(math.Abs(objRetention.RetainUntilDate.Sub(t).Hours()) / 24))
 
 	ret := objectlock.GetObjectRetentionMeta(oi.UserDefined)
 	if ret.Mode.Valid() {
 		// Retention has expired you may change whatever you like.
 		if ret.RetainUntilDate.Before(t) {
-			apiErr := isPutRetentionAllowed(oi.Bucket, oi.Name,
+			perm := isPutRetentionAllowed(bucket, object,
 				days, objRetention.RetainUntilDate.Time,
 				objRetention.Mode, byPassSet, r, cred,
-				owner)
-			switch apiErr {
-			case ErrAccessDenied:
-				return errAuthentication
-			}
-			return nil
+				owner, claims)
+			return oi, perm
 		}
 
 		switch ret.Mode {
 		case objectlock.RetGovernance:
-			govPerm := isPutRetentionAllowed(oi.Bucket, oi.Name, days,
+			govPerm := isPutRetentionAllowed(bucket, object, days,
 				objRetention.RetainUntilDate.Time, objRetention.Mode,
-				byPassSet, r, cred, owner)
+				byPassSet, r, cred, owner, claims)
 			// Governance mode retention period cannot be shortened, if x-amz-bypass-governance is not set.
 			if !byPassSet {
 				if objRetention.Mode != objectlock.RetGovernance || objRetention.RetainUntilDate.Before((ret.RetainUntilDate.Time)) {
-					return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
+					return oi, ErrObjectLocked
 				}
 			}
-			switch govPerm {
-			case ErrAccessDenied:
-				return errAuthentication
-			}
-			return nil
+			return oi, govPerm
 		case objectlock.RetCompliance:
 			// Compliance retention mode cannot be changed or shortened.
 			// https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lock-overview.html#object-lock-retention-modes
 			if objRetention.Mode != objectlock.RetCompliance || objRetention.RetainUntilDate.Before((ret.RetainUntilDate.Time)) {
-				return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
+				return oi, ErrObjectLocked
 			}
-			apiErr := isPutRetentionAllowed(oi.Bucket, oi.Name,
+			compliancePerm := isPutRetentionAllowed(bucket, object,
 				days, objRetention.RetainUntilDate.Time, objRetention.Mode,
-				false, r, cred, owner)
-			switch apiErr {
-			case ErrAccessDenied:
-				return errAuthentication
-			}
-			return nil
+				false, r, cred, owner, claims)
+			return oi, compliancePerm
 		}
-		return nil
+		return oi, ErrNone
 	} // No pre-existing retention metadata present.
 
-	apiErr := isPutRetentionAllowed(oi.Bucket, oi.Name,
+	perm := isPutRetentionAllowed(bucket, object,
 		days, objRetention.RetainUntilDate.Time,
-		objRetention.Mode, byPassSet, r, cred, owner)
-	switch apiErr {
-	case ErrAccessDenied:
-		return errAuthentication
-	}
-	return nil
+		objRetention.Mode, byPassSet, r, cred, owner, claims)
+	return oi, perm
 }
 
 // checkPutObjectLockAllowed enforces object retention policy and legal hold policy

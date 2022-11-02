@@ -1,11 +1,11 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -72,6 +72,7 @@ func TestToGCSPageToken(t *testing.T) {
 			t.Errorf("Test %d: Expected %s, got %s", i+1, toGCSPageToken(testCase.Name), testCase.Token)
 		}
 	}
+
 }
 
 // TestIsValidGCSProjectIDFormat tests isValidGCSProjectIDFormat
@@ -165,6 +166,7 @@ func TestGCSMultipartDataName(t *testing.T) {
 }
 
 func TestFromMinioClientListBucketResultToV2Info(t *testing.T) {
+
 	listBucketResult := miniogo.ListBucketResult{
 		IsTruncated:    false,
 		Marker:         "testMarker",
@@ -188,12 +190,13 @@ func TestFromMinioClientListBucketResultToV2Info(t *testing.T) {
 
 // Test for gcsParseProjectID
 func TestGCSParseProjectID(t *testing.T) {
-	f, err := ioutil.TempFile("", "TestGCSParseProjectID-*")
+	f, err := ioutil.TempFile("", "")
 	if err != nil {
 		t.Error(err)
 		return
 	}
 	defer os.Remove(f.Name())
+	defer f.Close()
 
 	contents := `
 {
@@ -202,7 +205,6 @@ func TestGCSParseProjectID(t *testing.T) {
 }
 `
 	f.WriteString(contents)
-	f.Close()
 	projectID, err := gcsParseProjectID(f.Name())
 	if err != nil {
 		t.Fatal(err)
@@ -215,20 +217,8 @@ func TestGCSParseProjectID(t *testing.T) {
 		t.Errorf(`Expected to fail but succeeded reading "non-existent"`)
 	}
 
-	contents = `
-{
-  "type": "service_account",
-  "project_id": "miniotesting"
-},}
-`
-	f, err = ioutil.TempFile("", "TestGCSParseProjectID-*")
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	defer os.Remove(f.Name())
-	f.WriteString(contents)
-	f.Close()
+	f.WriteString(`,}`)
+
 	if _, err := gcsParseProjectID(f.Name()); err == nil {
 		t.Errorf(`Expected to fail reading corrupted credentials file`)
 	}

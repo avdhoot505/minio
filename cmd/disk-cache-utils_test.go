@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -38,7 +37,7 @@ func TestGetCacheControlOpts(t *testing.T) {
 		{"max-age=2592000, no-store", timeSentinel, &cacheControl{maxAge: 2592000, sMaxAge: 0, noStore: true, minFresh: 0, expiry: time.Time{}}, false},
 		{"must-revalidate, max-age=600", timeSentinel, &cacheControl{maxAge: 600, sMaxAge: 0, minFresh: 0, expiry: time.Time{}}, false},
 		{"s-maxAge=2500, max-age=600", timeSentinel, &cacheControl{maxAge: 600, sMaxAge: 2500, minFresh: 0, expiry: time.Time{}}, false},
-		{"s-maxAge=2500, max-age=600", expiry, &cacheControl{maxAge: 600, sMaxAge: 2500, minFresh: 0, expiry: time.Date(2015, time.October, 21, 0o7, 28, 0o0, 0o0, time.UTC)}, false},
+		{"s-maxAge=2500, max-age=600", expiry, &cacheControl{maxAge: 600, sMaxAge: 2500, minFresh: 0, expiry: time.Date(2015, time.October, 21, 07, 28, 00, 00, time.UTC)}, false},
 		{"s-maxAge=2500, max-age=600s", timeSentinel, &cacheControl{maxAge: 600, sMaxAge: 2500, minFresh: 0, expiry: time.Time{}}, true},
 	}
 
@@ -61,6 +60,7 @@ func TestGetCacheControlOpts(t *testing.T) {
 }
 
 func TestIsMetadataSame(t *testing.T) {
+
 	testCases := []struct {
 		m1       map[string]string
 		m2       map[string]string
@@ -147,7 +147,6 @@ func TestNewFileScorer(t *testing.T) {
 		t.Fatal("unexpected file list", fs.queueString())
 	}
 }
-
 func TestBytesToClear(t *testing.T) {
 	testCases := []struct {
 		total         int64

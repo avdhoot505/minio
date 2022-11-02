@@ -1,32 +1,29 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/cmd/logger"
 )
 
 // XL constants.
@@ -83,9 +80,6 @@ type xlMetaV1Object struct {
 type StatInfo struct {
 	Size    int64     `json:"size"`    // Size of the object `xl.meta`.
 	ModTime time.Time `json:"modTime"` // ModTime of the object `xl.meta`.
-	Name    string    `json:"name"`
-	Dir     bool      `json:"dir"`
-	Mode    uint32    `json:"mode"`
 }
 
 // ErasureInfo holds erasure coding and bitrot related information.
@@ -160,7 +154,7 @@ func (c ChecksumInfo) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON - custom checksum info unmarshaller
 func (c *ChecksumInfo) UnmarshalJSON(data []byte) error {
 	var info checksumInfoJSON
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal(data, &info); err != nil {
 		return err
 	}
@@ -182,51 +176,27 @@ func (c *ChecksumInfo) UnmarshalJSON(data []byte) error {
 }
 
 // constant and shouldn't be changed.
-const (
-	legacyDataDir = "legacy"
-)
+const legacyDataDir = "legacy"
 
 func (m *xlMetaV1Object) ToFileInfo(volume, path string) (FileInfo, error) {
 	if !m.valid() {
 		return FileInfo{}, errFileCorrupt
 	}
-
 	fi := FileInfo{
-		Volume:      volume,
-		Name:        path,
-		ModTime:     m.Stat.ModTime,
-		Size:        m.Stat.Size,
-		Metadata:    m.Meta,
-		Parts:       m.Parts,
-		Erasure:     m.Erasure,
-		VersionID:   m.VersionID,
-		DataDir:     m.DataDir,
-		XLV1:        true,
-		NumVersions: 1,
+		Volume:    volume,
+		Name:      path,
+		ModTime:   m.Stat.ModTime,
+		Size:      m.Stat.Size,
+		Metadata:  m.Meta,
+		Parts:     m.Parts,
+		Erasure:   m.Erasure,
+		VersionID: m.VersionID,
+		DataDir:   m.DataDir,
 	}
-
+	if st, ok := m.Meta[ReservedMetadataPrefixLower+"transition-status"]; ok {
+		fi.TransitionStatus = st
+	}
 	return fi, nil
-}
-
-// Signature will return a signature that is expected to be the same across all disks.
-func (m *xlMetaV1Object) Signature() [4]byte {
-	// Shallow copy
-	c := *m
-	// Zero unimportant fields
-	c.Erasure.Index = 0
-	c.Minio.Release = ""
-	crc := hashDeterministicString(c.Meta)
-	c.Meta = nil
-
-	if bts, err := c.MarshalMsg(metaDataPoolGet()); err == nil {
-		crc ^= xxhash.Sum64(bts)
-		metaDataPoolPut(bts)
-	}
-
-	// Combine upper and lower part
-	var tmp [4]byte
-	binary.LittleEndian.PutUint32(tmp[:], uint32(crc^(crc>>32)))
-	return tmp
 }
 
 // XL metadata constants.

@@ -6,7 +6,7 @@ This topic provides commands to set up different configurations of hosts, nodes,
 2. [Distributed Deployment](#distributed-deployment)
 3. [Cloud Scale Deployment](#cloud-scale-deployment)
 
-## 1. Standalone Deployment
+## <a name="standalone-deployment"></a>1. Standalone Deployment
 
 To host multiple tenants on a single machine, run one MinIO Server per tenant with a dedicated HTTPS port, configuration, and data directory.
 
@@ -34,7 +34,7 @@ minio server --address :9003 /disk{1...4}/data/tenant3
 
 ![Example-2](https://github.com/minio/minio/blob/master/docs/screenshots/Example-2.jpg?raw=true)
 
-## 2. Distributed Deployment
+## <a name="distributed-deployment"></a>2. Distributed Deployment
 
 To host multiple tenants in a distributed environment, run several distributed MinIO Server instances concurrently.
 
@@ -60,8 +60,8 @@ minio server --address :9003 http://192.168.10.1{1...4}/data/tenant3
 
 ![Example-3](https://github.com/minio/minio/blob/master/docs/screenshots/Example-3.jpg?raw=true)
 
-**Note**: On distributed systems, root credentials are recommend to be defined by exporting the `MINIO_ROOT_USER` and  `MINIO_ROOT_PASSWORD` environment variables. If no value is set MinIO setup will assume `minioadmin/minioadmin` as default credentials. If a domain is required, it must be specified by defining and exporting the `MINIO_DOMAIN` environment variable.
+**Note**: On distributed systems, credentials must be defined and exported using the `MINIO_ROOT_USER` and  `MINIO_ROOT_PASSWORD` environment variables. If a domain is required, it must be specified by defining and exporting the `MINIO_DOMAIN` environment variable.
 
-## Cloud Scale Deployment
+## <a name="cloud-scale-deployment"></a>Cloud Scale Deployment
 
 A container orchestration platform (e.g. Kubernetes) is recommended for large-scale, multi-tenant MinIO deployments. See the [MinIO Deployment Quickstart Guide](https://docs.min.io/docs/minio-deployment-quickstart-guide) to get started with MinIO on orchestration platforms.

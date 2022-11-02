@@ -1,35 +1,31 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"time"
 
-	jwtgo "github.com/golang-jwt/jwt/v4"
-	jwtreq "github.com/golang-jwt/jwt/v4/request"
-	lru "github.com/hashicorp/golang-lru"
-	"github.com/minio/minio/internal/auth"
-	xjwt "github.com/minio/minio/internal/jwt"
-	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	jwtgo "github.com/dgrijalva/jwt-go"
+	jwtreq "github.com/dgrijalva/jwt-go/request"
+	xjwt "github.com/minio/minio/cmd/jwt"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
 )
 
 const (
@@ -46,9 +42,12 @@ const (
 )
 
 var (
-	errInvalidAccessKeyID = errors.New("The access key ID you provided does not exist in our records")
-	errAuthentication     = errors.New("Authentication failed, check your access credentials")
-	errNoAuthToken        = errors.New("JWT token missing")
+	errInvalidAccessKeyID   = errors.New("The access key ID you provided does not exist in our records")
+	errChangeCredNotAllowed = errors.New("Changing access key and secret key not allowed")
+	errAuthentication       = errors.New("Authentication failed, check your access credentials")
+	errNoAuthToken          = errors.New("JWT token missing")
+	errIncorrectCreds       = errors.New("Current access key or secret key is incorrect")
+	errPresignedNotAllowed  = errors.New("Unable to generate shareable URL due to lack of read permissions")
 )
 
 func authenticateJWTUsers(accessKey, secretKey string, expiry time.Duration) (string, error) {
@@ -64,7 +63,7 @@ func authenticateJWTUsersWithCredentials(credentials auth.Credentials, expiresAt
 	serverCred := globalActiveCred
 	if serverCred.AccessKey != credentials.AccessKey {
 		var ok bool
-		serverCred, ok = globalIAMSys.GetUser(context.TODO(), credentials.AccessKey)
+		serverCred, ok = globalIAMSys.GetUser(credentials.AccessKey)
 		if !ok {
 			return "", errInvalidAccessKeyID
 		}
@@ -80,35 +79,6 @@ func authenticateJWTUsersWithCredentials(credentials auth.Credentials, expiresAt
 
 	jwt := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, claims)
 	return jwt.SignedString([]byte(serverCred.SecretKey))
-}
-
-// cachedAuthenticateNode will cache authenticateNode results for given values up to ttl.
-func cachedAuthenticateNode(ttl time.Duration) func(accessKey, secretKey, audience string) (string, error) {
-	type key struct {
-		accessKey, secretKey, audience string
-	}
-	type value struct {
-		created time.Time
-		res     string
-		err     error
-	}
-	cache, err := lru.NewARC(100)
-	if err != nil {
-		logger.LogIf(GlobalContext, err)
-		return authenticateNode
-	}
-	return func(accessKey, secretKey, audience string) (string, error) {
-		k := key{accessKey: accessKey, secretKey: secretKey, audience: audience}
-		v, ok := cache.Get(k)
-		if ok {
-			if val, ok := v.(*value); ok && time.Since(val.created) < ttl {
-				return val.res, val.err
-			}
-		}
-		s, err := authenticateNode(accessKey, secretKey, audience)
-		cache.Add(k, &value{created: time.Now(), res: s, err: err})
-		return s, err
-	}
 }
 
 func authenticateNode(accessKey, secretKey, audience string) (string, error) {
@@ -129,70 +99,68 @@ func authenticateURL(accessKey, secretKey string) (string, error) {
 	return authenticateJWTUsers(accessKey, secretKey, defaultURLJWTExpiry)
 }
 
+// Callback function used for parsing
+func webTokenCallback(claims *xjwt.MapClaims) ([]byte, error) {
+	if claims.AccessKey == globalActiveCred.AccessKey {
+		return []byte(globalActiveCred.SecretKey), nil
+	}
+	ok, err := globalIAMSys.IsTempUser(claims.AccessKey)
+	if err != nil {
+		if err == errNoSuchUser {
+			return nil, errInvalidAccessKeyID
+		}
+		return nil, err
+	}
+	if ok {
+		return []byte(globalActiveCred.SecretKey), nil
+	}
+	cred, ok := globalIAMSys.GetUser(claims.AccessKey)
+	if !ok {
+		return nil, errInvalidAccessKeyID
+	}
+	return []byte(cred.SecretKey), nil
+
+}
+
+func isAuthTokenValid(token string) bool {
+	_, _, err := webTokenAuthenticate(token)
+	return err == nil
+}
+
+func webTokenAuthenticate(token string) (*xjwt.MapClaims, bool, error) {
+	if token == "" {
+		return nil, false, errNoAuthToken
+	}
+	claims := xjwt.NewMapClaims()
+	if err := xjwt.ParseWithClaims(token, claims, webTokenCallback); err != nil {
+		return claims, false, errAuthentication
+	}
+	owner := claims.AccessKey == globalActiveCred.AccessKey
+	return claims, owner, nil
+}
+
 // Check if the request is authenticated.
 // Returns nil if the request is authenticated. errNoAuthToken if token missing.
 // Returns errAuthentication for all other errors.
-func metricsRequestAuthenticate(req *http.Request) (*xjwt.MapClaims, []string, bool, error) {
+func webRequestAuthenticate(req *http.Request) (*xjwt.MapClaims, bool, error) {
 	token, err := jwtreq.AuthorizationHeaderExtractor.ExtractToken(req)
 	if err != nil {
 		if err == jwtreq.ErrNoTokenInRequest {
-			return nil, nil, false, errNoAuthToken
+			return nil, false, errNoAuthToken
 		}
-		return nil, nil, false, err
+		return nil, false, err
 	}
 	claims := xjwt.NewMapClaims()
-	if err := xjwt.ParseWithClaims(token, claims, func(claims *xjwt.MapClaims) ([]byte, error) {
-		if claims.AccessKey == globalActiveCred.AccessKey {
-			return []byte(globalActiveCred.SecretKey), nil
-		}
-		cred, ok := globalIAMSys.GetUser(req.Context(), claims.AccessKey)
-		if !ok {
-			return nil, errInvalidAccessKeyID
-		}
-		return []byte(cred.SecretKey), nil
-	}); err != nil {
-		return claims, nil, false, errAuthentication
+	if err := xjwt.ParseWithClaims(token, claims, webTokenCallback); err != nil {
+		return claims, false, errAuthentication
 	}
-	owner := true
-	var groups []string
-	if globalActiveCred.AccessKey != claims.AccessKey {
-		// Check if the access key is part of users credentials.
-		ucred, ok := globalIAMSys.GetUser(req.Context(), claims.AccessKey)
-		if !ok {
-			return nil, nil, false, errInvalidAccessKeyID
-		}
-
-		// get embedded claims
-		eclaims, s3Err := checkClaimsFromToken(req, ucred)
-		if s3Err != ErrNone {
-			return nil, nil, false, errAuthentication
-		}
-
-		for k, v := range eclaims {
-			claims.MapClaims[k] = v
-		}
-
-		// Now check if we have a sessionPolicy.
-		if _, ok = eclaims[iampolicy.SessionPolicyName]; ok {
-			owner = false
-		} else {
-			owner = globalActiveCred.AccessKey == ucred.ParentUser
-		}
-
-		groups = ucred.Groups
-	}
-
-	return claims, groups, owner, nil
+	owner := claims.AccessKey == globalActiveCred.AccessKey
+	return claims, owner, nil
 }
 
-// newCachedAuthToken returns a token that is cached up to 15 seconds.
-// If globalActiveCred is updated it is reflected at once.
-func newCachedAuthToken() func(audience string) string {
-	fn := cachedAuthenticateNode(15 * time.Second)
-	return func(audience string) string {
-		cred := globalActiveCred
-		token, err := fn(cred.AccessKey, cred.SecretKey, audience)
-		logger.CriticalIf(GlobalContext, err)
-		return token
-	}
+func newAuthToken(audience string) string {
+	cred := globalActiveCred
+	token, err := authenticateNode(cred.AccessKey, cred.SecretKey, audience)
+	logger.CriticalIf(GlobalContext, err)
+	return token
 }

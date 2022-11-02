@@ -1,30 +1,28 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"hash/crc32"
 
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/sync/errgroup"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
 // Returns number of errors that occurred the most (incl. nil) and the
@@ -37,11 +35,6 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 	errorCounts := make(map[error]int)
 	for _, err := range errs {
 		if IsErrIgnored(err, ignoredErrs...) {
-			continue
-		}
-		// Errors due to context cancelation may be wrapped - group them by context.Canceled.
-		if errors.Is(err, context.Canceled) {
-			errorCounts[context.Canceled]++
 			continue
 		}
 		errorCounts[err]++
@@ -67,9 +60,6 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 // values of maximally occurring errors validated against a generic
 // quorum number that can be read or write quorum depending on usage.
 func reduceQuorumErrs(ctx context.Context, errs []error, ignoredErrs []error, quorum int, quorumErr error) error {
-	if contextCanceled(ctx) {
-		return context.Canceled
-	}
 	maxCount, maxErr := reduceErrs(errs, ignoredErrs)
 	if maxCount >= quorum {
 		return maxErr
@@ -144,9 +134,7 @@ func readAllFileInfo(ctx context.Context, disks []StorageAPI, bucket, object, ve
 					errFileVersionNotFound,
 					errDiskNotFound,
 				}...) {
-					logger.LogOnceIf(ctx, fmt.Errorf("Drive %s, path (%s/%s) returned an error (%w)",
-						disks[index], bucket, object, err),
-						disks[index].String())
+					logger.LogOnceIf(ctx, err, disks[index].String())
 				}
 			}
 			return err
@@ -157,32 +145,15 @@ func readAllFileInfo(ctx context.Context, disks []StorageAPI, bucket, object, ve
 	return metadataArray, g.Wait()
 }
 
-// shuffleDisksAndPartsMetadataByIndex this function should be always used by GetObjectNInfo()
-// and CompleteMultipartUpload code path, it is not meant to be used with PutObject,
-// NewMultipartUpload metadata shuffling.
-func shuffleDisksAndPartsMetadataByIndex(disks []StorageAPI, metaArr []FileInfo, fi FileInfo) (shuffledDisks []StorageAPI, shuffledPartsMetadata []FileInfo) {
+func shuffleDisksAndPartsMetadataByIndex(disks []StorageAPI, metaArr []FileInfo, distribution []int) (shuffledDisks []StorageAPI, shuffledPartsMetadata []FileInfo) {
 	shuffledDisks = make([]StorageAPI, len(disks))
 	shuffledPartsMetadata = make([]FileInfo, len(disks))
-	distribution := fi.Erasure.Distribution
-
 	var inconsistent int
 	for i, meta := range metaArr {
 		if disks[i] == nil {
 			// Assuming offline drives as inconsistent,
 			// to be safe and fallback to original
 			// distribution order.
-			inconsistent++
-			continue
-		}
-		if !meta.IsValid() {
-			inconsistent++
-			continue
-		}
-		if len(fi.Data) != len(meta.Data) {
-			inconsistent++
-			continue
-		}
-		if meta.XLV1 != fi.XLV1 {
 			inconsistent++
 			continue
 		}
@@ -200,44 +171,23 @@ func shuffleDisksAndPartsMetadataByIndex(disks []StorageAPI, metaArr []FileInfo,
 	// Inconsistent meta info is with in the limit of
 	// expected quorum, proceed with EcIndex based
 	// disk order.
-	if inconsistent < fi.Erasure.ParityBlocks {
+	if inconsistent < len(disks)/2 {
 		return shuffledDisks, shuffledPartsMetadata
 	}
 
 	// fall back to original distribution based order.
-	return shuffleDisksAndPartsMetadata(disks, metaArr, fi)
+	return shuffleDisksAndPartsMetadata(disks, metaArr, distribution)
 }
 
-// Return shuffled partsMetadata depending on fi.Distribution.
-// additional validation is attempted and invalid metadata is
-// automatically skipped only when fi.ModTime is non-zero
-// indicating that this is called during read-phase
-func shuffleDisksAndPartsMetadata(disks []StorageAPI, partsMetadata []FileInfo, fi FileInfo) (shuffledDisks []StorageAPI, shuffledPartsMetadata []FileInfo) {
+// Return shuffled partsMetadata depending on distribution.
+func shuffleDisksAndPartsMetadata(disks []StorageAPI, partsMetadata []FileInfo, distribution []int) (shuffledDisks []StorageAPI, shuffledPartsMetadata []FileInfo) {
+	if distribution == nil {
+		return disks, partsMetadata
+	}
 	shuffledDisks = make([]StorageAPI, len(disks))
 	shuffledPartsMetadata = make([]FileInfo, len(partsMetadata))
-	distribution := fi.Erasure.Distribution
-
-	init := fi.ModTime.IsZero()
 	// Shuffle slice xl metadata for expected distribution.
 	for index := range partsMetadata {
-		if disks[index] == nil {
-			continue
-		}
-		if !init && !partsMetadata[index].IsValid() {
-			// Check for parts metadata validity for only
-			// fi.ModTime is not empty - ModTime is always set,
-			// if object was ever written previously.
-			continue
-		}
-		if !init && len(fi.Data) != len(partsMetadata[index].Data) {
-			// Check for length of data parts only when
-			// fi.ModTime is not empty - ModTime is always set,
-			// if object was ever written previously.
-			continue
-		}
-		if !init && fi.XLV1 != partsMetadata[index].XLV1 {
-			continue
-		}
 		blockIndex := distribution[index]
 		shuffledPartsMetadata[blockIndex-1] = partsMetadata[index]
 		shuffledDisks[blockIndex-1] = disks[index]

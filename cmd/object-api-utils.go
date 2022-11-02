@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2015-2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -39,16 +38,17 @@ import (
 	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/readahead"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
-	"github.com/minio/minio/internal/config/compress"
-	"github.com/minio/minio/internal/config/dns"
-	"github.com/minio/minio/internal/config/storageclass"
-	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/minio/internal/hash"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/trie"
-	"github.com/minio/pkg/wildcard"
+	"github.com/minio/minio/cmd/config/compress"
+	"github.com/minio/minio/cmd/config/dns"
+	"github.com/minio/minio/cmd/config/storageclass"
+	"github.com/minio/minio/cmd/crypto"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/bucket/lifecycle"
+	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/ioutil"
+	"github.com/minio/minio/pkg/trie"
+	"github.com/minio/minio/pkg/wildcard"
 )
 
 const (
@@ -58,10 +58,8 @@ const (
 	mpartMetaPrefix = "multipart"
 	// MinIO Multipart meta prefix.
 	minioMetaMultipartBucket = minioMetaBucket + SlashSeparator + mpartMetaPrefix
-	// MinIO tmp meta prefix.
+	// MinIO Tmp meta prefix.
 	minioMetaTmpBucket = minioMetaBucket + "/tmp"
-	// MinIO tmp meta prefix for deleted objects.
-	minioMetaTmpDeletedBucket = minioMetaTmpBucket + "/.trash"
 	// DNS separator (period), used for bucket name validation.
 	dnsDelimiter = "."
 	// On compressed files bigger than this;
@@ -75,7 +73,10 @@ const (
 // isMinioBucket returns true if given bucket is a MinIO internal
 // bucket and false otherwise.
 func isMinioMetaBucketName(bucket string) bool {
-	return strings.HasPrefix(bucket, minioMetaBucket)
+	return bucket == minioMetaBucket ||
+		bucket == minioMetaMultipartBucket ||
+		bucket == minioMetaTmpBucket ||
+		bucket == dataUsageBucket
 }
 
 // IsValidBucketName verifies that a bucket name is in accordance with
@@ -203,9 +204,6 @@ const SlashSeparator = "/"
 
 // retainSlash - retains slash from a path.
 func retainSlash(s string) string {
-	if s == "" {
-		return s
-	}
 	return strings.TrimSuffix(s, SlashSeparator) + SlashSeparator
 }
 
@@ -260,7 +258,7 @@ func cleanMetadata(metadata map[string]string) map[string]string {
 	// Remove STANDARD StorageClass
 	metadata = removeStandardStorageClass(metadata)
 	// Clean meta etag keys 'md5Sum', 'etag', "expires", "x-amz-tagging".
-	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified", VersionPurgeStatusKey)
+	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified")
 }
 
 // Filter X-Amz-Storage-Class field only if it is set to STANDARD.
@@ -275,7 +273,7 @@ func removeStandardStorageClass(metadata map[string]string) map[string]string {
 // cleanMetadataKeys takes keyNames to be filtered
 // and returns a new map with all the entries with keyNames removed.
 func cleanMetadataKeys(metadata map[string]string, keyNames ...string) map[string]string {
-	newMeta := make(map[string]string, len(metadata))
+	var newMeta = make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		if contains(keyNames, k) {
 			continue
@@ -287,10 +285,10 @@ func cleanMetadataKeys(metadata map[string]string, keyNames ...string) map[strin
 
 // Extracts etag value from the metadata.
 func extractETag(metadata map[string]string) string {
-	etag, ok := metadata["etag"]
+	// md5Sum tag is kept for backward compatibility.
+	etag, ok := metadata["md5Sum"]
 	if !ok {
-		// md5Sum tag is kept for backward compatibility.
-		etag = metadata["md5Sum"]
+		etag = metadata["etag"]
 	}
 	// Success.
 	return etag
@@ -386,13 +384,13 @@ func getHostFromSrv(records []dns.SrvRecord) (host string) {
 }
 
 // IsCompressed returns true if the object is marked as compressed.
-func (o *ObjectInfo) IsCompressed() bool {
+func (o ObjectInfo) IsCompressed() bool {
 	_, ok := o.UserDefined[ReservedMetadataPrefix+"compression"]
 	return ok
 }
 
 // IsCompressedOK returns whether the object is compressed and can be decompressed.
-func (o *ObjectInfo) IsCompressedOK() (bool, error) {
+func (o ObjectInfo) IsCompressedOK() (bool, error) {
 	scheme, ok := o.UserDefined[ReservedMetadataPrefix+"compression"]
 	if !ok {
 		return false, nil
@@ -404,8 +402,17 @@ func (o *ObjectInfo) IsCompressedOK() (bool, error) {
 	return true, fmt.Errorf("unknown compression scheme: %s", scheme)
 }
 
+// GetActualETag - returns the actual etag of the stored object
+// decrypts SSE objects.
+func (o ObjectInfo) GetActualETag(h http.Header) string {
+	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
+		return o.ETag
+	}
+	return getDecryptedETag(h, o, false)
+}
+
 // GetActualSize - returns the actual size of the stored object
-func (o *ObjectInfo) GetActualSize() (int64, error) {
+func (o ObjectInfo) GetActualSize() (int64, error) {
 	if o.IsCompressed() {
 		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
 		if !ok {
@@ -501,7 +508,7 @@ func partNumberToRangeSpec(oi ObjectInfo, partNumber int) *HTTPRangeSpec {
 	}
 
 	var start int64
-	end := int64(-1)
+	var end = int64(-1)
 	for i := 0; i < len(oi.Parts) && i < partNumber; i++ {
 		start = end + 1
 		end = start + oi.Parts[i].ActualSize - 1
@@ -530,24 +537,23 @@ func getCompressedOffsets(objectInfo ObjectInfo, offset int64) (compressedOffset
 		}
 	}
 
+	if isEncryptedMultipart(objectInfo) && firstPartIdx > 0 {
+		off, _, _, _, _, err := objectInfo.GetDecryptedRange(partNumberToRangeSpec(objectInfo, firstPartIdx))
+		logger.LogIf(context.Background(), err)
+		compressedOffset += off
+	}
 	return compressedOffset, offset - skipLength, firstPartIdx
 }
 
 // GetObjectReader is a type that wraps a reader with a lock to
 // provide a ReadCloser interface that unlocks on Close()
 type GetObjectReader struct {
-	io.Reader
-	ObjInfo    ObjectInfo
+	ObjInfo ObjectInfo
+	pReader io.Reader
+
 	cleanUpFns []func()
 	opts       ObjectOptions
 	once       sync.Once
-}
-
-// WithCleanupFuncs sets additional cleanup functions to be called when closing
-// the GetObjectReader.
-func (g *GetObjectReader) WithCleanupFuncs(fns ...func()) *GetObjectReader {
-	g.cleanUpFns = append(g.cleanUpFns, fns...)
-	return g
 }
 
 // NewGetObjectReaderFromReader sets up a GetObjectReader with a given
@@ -562,7 +568,7 @@ func NewGetObjectReaderFromReader(r io.Reader, oi ObjectInfo, opts ObjectOptions
 	}
 	return &GetObjectReader{
 		ObjInfo:    oi,
-		Reader:     r,
+		pReader:    r,
 		cleanUpFns: cleanupFns,
 		opts:       opts,
 	}, nil
@@ -572,22 +578,28 @@ func NewGetObjectReaderFromReader(r io.Reader, oi ObjectInfo, opts ObjectOptions
 // GetObjectReader and an error. Request headers are passed to provide
 // encryption parameters. cleanupFns allow cleanup funcs to be
 // registered for calling after usage of the reader.
-type ObjReaderFn func(inputReader io.Reader, h http.Header, cleanupFns ...func()) (r *GetObjectReader, err error)
+type ObjReaderFn func(inputReader io.Reader, h http.Header, pcfn CheckPreconditionFn, cleanupFns ...func()) (r *GetObjectReader, err error)
 
 // NewGetObjectReader creates a new GetObjectReader. The cleanUpFns
-// are called on Close() in FIFO order as passed in ObjReadFn(). NOTE: It is
+// are called on Close() in reverse order as passed here. NOTE: It is
 // assumed that clean up functions do not panic (otherwise, they may
 // not all run!).
-func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
-	fn ObjReaderFn, off, length int64, err error,
-) {
-	if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
-		return nil, 0, 0, PreConditionFailed{}
-	}
+func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cleanUpFns ...func()) (
+	fn ObjReaderFn, off, length int64, err error) {
 
 	if rs == nil && opts.PartNumber > 0 {
 		rs = partNumberToRangeSpec(oi, opts.PartNumber)
 	}
+
+	// Call the clean-up functions immediately in case of exit
+	// with error
+	defer func() {
+		if err != nil {
+			for i := len(cleanUpFns) - 1; i >= 0; i-- {
+				cleanUpFns[i]()
+			}
+		}
+	}()
 
 	_, isEncrypted := crypto.IsEncrypted(oi.UserDefined)
 	isCompressed, err := oi.IsCompressedOK()
@@ -595,8 +607,8 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 		return nil, 0, 0, err
 	}
 
-	// if object is encrypted and it is a restore request, fetch content without decrypting.
-	if opts.Transition.RestoreRequest != nil {
+	// if object is encrypted, transition content without decrypting.
+	if opts.TransitionStatus == lifecycle.TransitionPending && (isEncrypted || isCompressed) {
 		isEncrypted = false
 		isCompressed = false
 	}
@@ -618,7 +630,6 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 		if err != nil {
 			return nil, 0, 0, err
 		}
-
 		off, length = int64(0), oi.Size
 		decOff, decLength := int64(0), actualSize
 		if rs != nil {
@@ -626,10 +637,8 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 			if err != nil {
 				return nil, 0, 0, err
 			}
-
 			// In case of range based queries on multiparts, the offset and length are reduced.
 			off, decOff, firstPart = getCompressedOffsets(oi, off)
-
 			decLength = length
 			length = oi.Size - off
 			// For negative length we read everything.
@@ -642,7 +651,15 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 				return nil, 0, 0, errInvalidRange
 			}
 		}
-		fn = func(inputReader io.Reader, h http.Header, cFns ...func()) (r *GetObjectReader, err error) {
+		fn = func(inputReader io.Reader, h http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
+			cFns = append(cleanUpFns, cFns...)
+			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+				// Call the cleanup funcs
+				for i := len(cFns) - 1; i >= 0; i-- {
+					cFns[i]()
+				}
+				return nil, PreConditionFailed{}
+			}
 			if isEncrypted {
 				copySource := h.Get(xhttp.AmzServerSideEncryptionCopyCustomerAlgorithm) != ""
 				// Attach decrypter on inputReader
@@ -674,9 +691,9 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 				rah, err := readahead.NewReaderSize(decReader, compReadAheadBuffers, compReadAheadBufSize)
 				if err == nil {
 					decReader = rah
-					cFns = append([]func(){func() {
+					cFns = append(cFns, func() {
 						rah.Close()
-					}}, cFns...)
+					})
 				}
 			}
 			oi.Size = decLength
@@ -684,7 +701,7 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 			// Assemble the GetObjectReader
 			r = &GetObjectReader{
 				ObjInfo:    oi,
-				Reader:     decReader,
+				pReader:    decReader,
 				cleanUpFns: cFns,
 				opts:       opts,
 			}
@@ -715,9 +732,10 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 		// a reader that returns the desired range of
 		// encrypted bytes. The header parameter is used to
 		// provide encryption parameters.
-		fn = func(inputReader io.Reader, h http.Header, cFns ...func()) (r *GetObjectReader, err error) {
+		fn = func(inputReader io.Reader, h http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
 			copySource := h.Get(xhttp.AmzServerSideEncryptionCopyCustomerAlgorithm) != ""
 
+			cFns = append(cleanUpFns, cFns...)
 			// Attach decrypter on inputReader
 			var decReader io.Reader
 			decReader, err = DecryptBlocksRequestR(inputReader, h, seqNumber, partStart, oi, copySource)
@@ -729,6 +747,14 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 				return nil, err
 			}
 
+			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+				// Call the cleanup funcs
+				for i := len(cFns) - 1; i >= 0; i-- {
+					cFns[i]()
+				}
+				return nil, PreConditionFailed{}
+			}
+
 			oi.ETag = getDecryptedETag(h, oi, false)
 
 			// Apply the skipLen and limit on the
@@ -738,7 +764,7 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 			// Assemble the GetObjectReader
 			r = &GetObjectReader{
 				ObjInfo:    oi,
-				Reader:     decReader,
+				pReader:    decReader,
 				cleanUpFns: cFns,
 				opts:       opts,
 			}
@@ -750,10 +776,18 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		fn = func(inputReader io.Reader, _ http.Header, cFns ...func()) (r *GetObjectReader, err error) {
+		fn = func(inputReader io.Reader, _ http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
+			cFns = append(cleanUpFns, cFns...)
+			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+				// Call the cleanup funcs
+				for i := len(cFns) - 1; i >= 0; i-- {
+					cFns[i]()
+				}
+				return nil, PreConditionFailed{}
+			}
 			r = &GetObjectReader{
 				ObjInfo:    oi,
-				Reader:     inputReader,
+				pReader:    inputReader,
 				cleanUpFns: cFns,
 				opts:       opts,
 			}
@@ -765,9 +799,6 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 
 // Close - calls the cleanup actions in reverse order
 func (g *GetObjectReader) Close() error {
-	if g == nil {
-		return nil
-	}
 	// sync.Once is used here to ensure that Close() is
 	// idempotent.
 	g.once.Do(func() {
@@ -778,7 +809,18 @@ func (g *GetObjectReader) Close() error {
 	return nil
 }
 
-// SealMD5CurrFn seals md5sum with object encryption key and returns sealed
+// Read - to implement Reader interface.
+func (g *GetObjectReader) Read(p []byte) (n int, err error) {
+	n, err = g.pReader.Read(p)
+	if err != nil {
+		// Calling code may not Close() in case of error, so
+		// we ensure it.
+		g.Close()
+	}
+	return
+}
+
+//SealMD5CurrFn seals md5sum with object encryption key and returns sealed
 // md5sum
 type SealMD5CurrFn func([]byte) []byte
 
@@ -861,7 +903,7 @@ func sealETagFn(key crypto.ObjectKey) SealMD5CurrFn {
 // CleanMinioInternalMetadataKeys removes X-Amz-Meta- prefix from minio internal
 // encryption metadata that was sent by minio gateway
 func CleanMinioInternalMetadataKeys(metadata map[string]string) map[string]string {
-	newMeta := make(map[string]string, len(metadata))
+	var newMeta = make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		if strings.HasPrefix(k, "X-Amz-Meta-X-Minio-Internal-") {
 			newMeta[strings.TrimPrefix(k, "X-Amz-Meta-")] = v
@@ -872,16 +914,6 @@ func CleanMinioInternalMetadataKeys(metadata map[string]string) map[string]strin
 	return newMeta
 }
 
-// compressOpts are the options for writing compressed data.
-var compressOpts []s2.WriterOption
-
-func init() {
-	if runtime.GOARCH == "amd64" {
-		// On amd64 we have assembly and can use stronger compression.
-		compressOpts = append(compressOpts, s2.WriterBetterCompression())
-	}
-}
-
 // newS2CompressReader will read data from r, compress it and return the compressed data as a Reader.
 // Use Close to ensure resources are released on incomplete streams.
 //
@@ -890,9 +922,9 @@ func init() {
 // client closed the stream prematurely.
 func newS2CompressReader(r io.Reader, on int64) io.ReadCloser {
 	pr, pw := io.Pipe()
+	comp := s2.NewWriter(pw)
 	// Copy input to compressor
 	go func() {
-		comp := s2.NewWriter(pw, compressOpts...)
 		cn, err := io.Copy(comp, r)
 		if err != nil {
 			comp.Close()
@@ -907,108 +939,12 @@ func newS2CompressReader(r io.Reader, on int64) io.ReadCloser {
 			return
 		}
 		// Close the stream.
-		pw.CloseWithError(comp.Close())
+		if err = comp.Close(); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		// Everything ok, do regular close.
+		pw.Close()
 	}()
 	return pr
-}
-
-// compressSelfTest performs a self-test to ensure that compression
-// algorithms completes a roundtrip. If any algorithm
-// produces an incorrect checksum it fails with a hard error.
-//
-// compressSelfTest tries to catch any issue in the compression implementation
-// early instead of silently corrupting data.
-func compressSelfTest() {
-	// 4 MB block.
-	// Approx runtime ~30ms
-	data := make([]byte, 4<<20)
-	rng := rand.New(rand.NewSource(0))
-	for i := range data {
-		// Generate compressible stream...
-		data[i] = byte(rng.Int63() & 3)
-	}
-	failOnErr := func(err error) {
-		if err != nil {
-			logger.Fatal(errSelfTestFailure, "compress: error on self-test: %v", err)
-		}
-	}
-	const skip = 2<<20 + 511
-	r := newS2CompressReader(bytes.NewBuffer(data), int64(len(data)))
-	b, err := io.ReadAll(r)
-	failOnErr(err)
-	failOnErr(r.Close())
-	// Decompression reader.
-	s2Reader := s2.NewReader(bytes.NewBuffer(b))
-	// Apply the skipLen on the decompressed stream.
-	failOnErr(s2Reader.Skip(skip))
-	got, err := io.ReadAll(s2Reader)
-	failOnErr(err)
-	if !bytes.Equal(got, data[skip:]) {
-		logger.Fatal(errSelfTestFailure, "compress: self-test roundtrip mismatch.")
-	}
-}
-
-// getDiskInfos returns the disk information for the provided disks.
-// If a disk is nil or an error is returned the result will be nil as well.
-func getDiskInfos(ctx context.Context, disks []StorageAPI) []*DiskInfo {
-	res := make([]*DiskInfo, len(disks))
-	for i, disk := range disks {
-		if disk == nil {
-			continue
-		}
-		if di, err := disk.DiskInfo(ctx); err == nil {
-			res[i] = &di
-		}
-	}
-	return res
-}
-
-// hasSpaceFor returns whether the disks in `di` have space for and object of a given size.
-func hasSpaceFor(di []*DiskInfo, size int64) bool {
-	// We multiply the size by 2 to account for erasure coding.
-	size *= 2
-	if size < 0 {
-		// If no size, assume diskAssumeUnknownSize.
-		size = diskAssumeUnknownSize
-	}
-
-	var available uint64
-	var total uint64
-	var nDisks int
-	for _, disk := range di {
-		if disk == nil || disk.Total == 0 || (disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0) {
-			// Disk offline, no inodes or something else is wrong.
-			continue
-		}
-		nDisks++
-		total += disk.Total
-		available += disk.Total - disk.Used
-	}
-
-	if nDisks == 0 {
-		return false
-	}
-
-	// Check we have enough on each disk, ignoring diskFillFraction.
-	perDisk := size / int64(nDisks)
-	for _, disk := range di {
-		if disk == nil || disk.Total == 0 || (disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0) {
-			continue
-		}
-		if int64(disk.Free) <= perDisk {
-			return false
-		}
-	}
-
-	// Make sure we can fit "size" on to the disk without getting above the diskFillFraction
-	if available < uint64(size) {
-		return false
-	}
-
-	// How much will be left after adding the file.
-	available -= uint64(size)
-
-	// wantLeft is how much space there at least must be left.
-	wantLeft := uint64(float64(total) * (1.0 - diskFillFraction))
-	return available > wantLeft
 }

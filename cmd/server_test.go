@@ -1,25 +1,23 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"bytes"
-	"context"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -35,8 +33,8 @@ import (
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/pkg/bucket/policy"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/pkg/bucket/policy"
 )
 
 // API suite container common to both FS and Erasure.
@@ -142,7 +140,7 @@ func TestServerSuite(t *testing.T) {
 }
 
 // Setting up the test suite.
-// Starting the Test server with temporary backend.
+// Starting the Test server with temporary FS backend.
 func (s *TestSuiteCommon) SetUpSuite(c *check) {
 	if s.secure {
 		cert, key, err := generateTLSCertKey("127.0.0.1")
@@ -159,27 +157,7 @@ func (s *TestSuiteCommon) SetUpSuite(c *check) {
 	s.secretKey = s.testServer.SecretKey
 }
 
-func (s *TestSuiteCommon) RestartTestServer(c *check) {
-	// Shutdown.
-	s.testServer.cancel()
-	s.testServer.Server.Close()
-	s.testServer.Obj.Shutdown(context.Background())
-
-	// Restart.
-	ctx, cancel := context.WithCancel(context.Background())
-
-	s.testServer.cancel = cancel
-	s.testServer = initTestServerWithBackend(ctx, c, s.testServer, s.testServer.Obj, s.testServer.rawDiskPaths)
-	if s.secure {
-		s.testServer.Server.StartTLS()
-	} else {
-		s.testServer.Server.Start()
-	}
-
-	s.client = s.testServer.Server.Client()
-	s.endPoint = s.testServer.Server.URL
-}
-
+// Called implicitly by "gopkg.in/check.v1" after all tests are run.
 func (s *TestSuiteCommon) TearDownSuite(c *check) {
 	s.testServer.Stop()
 }
@@ -257,6 +235,7 @@ func (s *TestSuiteCommon) TestCors(c *check) {
 			}
 		}
 	}
+
 }
 
 func (s *TestSuiteCommon) TestObjectDir(c *check) {
@@ -364,7 +343,7 @@ func (s *TestSuiteCommon) TestBucketPolicy(c *check) {
 	// assert the http response status code.
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	// Put a new bucket policy.
+	/// Put a new bucket policy.
 	request, err = newTestSignedRequest(http.MethodPut, getPutPolicyURL(s.endPoint, bucketName),
 		int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)), s.accessKey, s.secretKey, s.signer)
 	c.Assert(err, nil)
@@ -475,6 +454,7 @@ func (s *TestSuiteCommon) TestDeleteBucketNotEmpty(c *check) {
 	response, err = s.client.Do(request)
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusConflict)
+
 }
 
 func (s *TestSuiteCommon) TestListenNotificationHandler(c *check) {
@@ -574,9 +554,7 @@ func (s *TestSuiteCommon) TestDeleteMultipleObjects(c *check) {
 		c.Assert(response.StatusCode, http.StatusOK)
 		// Append all objects.
 		delObjReq.Objects = append(delObjReq.Objects, ObjectToDelete{
-			ObjectV: ObjectV{
-				ObjectName: objName,
-			},
+			ObjectName: objName,
 		})
 	}
 	// Marshal delete request.
@@ -591,7 +569,7 @@ func (s *TestSuiteCommon) TestDeleteMultipleObjects(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	deleteResp := DeleteObjectsResponse{}
+	var deleteResp = DeleteObjectsResponse{}
 	delRespBytes, err := ioutil.ReadAll(response.Body)
 	c.Assert(err, nil)
 	err = xml.Unmarshal(delRespBytes, &deleteResp)
@@ -980,7 +958,7 @@ func (s *TestSuiteCommon) TestPutBucket(c *check) {
 	wg.Wait()
 
 	bucketName = getRandomBucketName()
-	// Block 2: testing for correctness of the functionality
+	//Block 2: testing for correctness of the functionality
 	// HTTP request to create the bucket.
 	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
 		0, nil, s.accessKey, s.secretKey, s.signer)
@@ -1273,7 +1251,7 @@ func (s *TestSuiteCommon) TestPutObjectLongName(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	// make long object name.
+	//make long object name.
 	longObjName = fmt.Sprintf("%0255d/%0255d/%0255d/%0255d/%0255d", 1, 1, 1, 1, 1)
 	if IsDocker() || IsKubernetes() {
 		longObjName = fmt.Sprintf("%0242d/%0242d/%0242d/%0242d/%0242d", 1, 1, 1, 1, 1)
@@ -1289,7 +1267,20 @@ func (s *TestSuiteCommon) TestPutObjectLongName(c *check) {
 	c.Assert(response.StatusCode, http.StatusBadRequest)
 	verifyError(c, response, "KeyTooLongError", "Your key is too long", http.StatusBadRequest)
 
-	// make object name as unsupported
+	// make object name with prefix as slash
+	longObjName = fmt.Sprintf("/%0255d/%0255d", 1, 1)
+	buffer = bytes.NewReader([]byte("hello world"))
+	// create new HTTP request to insert the object.
+	request, err = newTestSignedRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, longObjName),
+		int64(buffer.Len()), buffer, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+	// execute the HTTP request.
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusBadRequest)
+	verifyError(c, response, "XMinioInvalidObjectName", "Object name contains a leading slash.", http.StatusBadRequest)
+
+	//make object name as unsupported
 	longObjName = fmt.Sprintf("%0256d", 1)
 	buffer = bytes.NewReader([]byte("hello world"))
 	request, err = newTestSignedRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, longObjName),
@@ -1405,6 +1396,7 @@ func (s *TestSuiteCommon) TestHeadOnObjectLastModified(c *check) {
 	// Since the "If-Modified-Since" header was ahead in time compared to the actual
 	// modified time of the object expecting the response status to be http.StatusNotModified.
 	c.Assert(response.StatusCode, http.StatusOK)
+
 }
 
 // TestHeadOnBucket - Validates response for HEAD on the bucket.
@@ -1593,26 +1585,24 @@ func (s *TestSuiteCommon) TestListObjectsHandler(c *check) {
 		c.Assert(response.StatusCode, http.StatusOK)
 	}
 
-	testCases := []struct {
+	var testCases = []struct {
 		getURL          string
 		expectedStrings []string
 	}{
 		{getListObjectsV1URL(s.endPoint, bucketName, "", "1000", ""), []string{"<Key>foo bar 1</Key>", "<Key>foo bar 2</Key>"}},
 		{getListObjectsV1URL(s.endPoint, bucketName, "", "1000", "url"), []string{"<Key>foo+bar+1</Key>", "<Key>foo+bar+2</Key>"}},
-		{
-			getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "", ""),
+		{getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "", ""),
 			[]string{
 				"<Key>foo bar 1</Key>",
 				"<Key>foo bar 2</Key>",
-				fmt.Sprintf("<Owner><ID>%s</ID><DisplayName>minio</DisplayName></Owner>", globalMinioDefaultOwnerID),
+				"<Owner><ID></ID><DisplayName></DisplayName></Owner>",
 			},
 		},
-		{
-			getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "true", ""),
+		{getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "true", ""),
 			[]string{
 				"<Key>foo bar 1</Key>",
 				"<Key>foo bar 2</Key>",
-				fmt.Sprintf("<Owner><ID>%s</ID><DisplayName>minio</DisplayName></Owner>", globalMinioDefaultOwnerID),
+				fmt.Sprintf("<Owner><ID>%s</ID><DisplayName></DisplayName></Owner>", globalMinioDefaultOwnerID),
 			},
 		},
 		{getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "", "url"), []string{"<Key>foo+bar+1</Key>", "<Key>foo+bar+2</Key>"}},
@@ -1670,6 +1660,7 @@ func (s *TestSuiteCommon) TestListObjectsHandlerErrors(c *check) {
 	c.Assert(err, nil)
 	// validating the error response.
 	verifyError(c, response, "InvalidArgument", "Argument maxKeys must be an integer between 0 and 2147483647", http.StatusBadRequest)
+
 }
 
 // TestPutBucketErrors - request for non valid bucket operation
@@ -1879,7 +1870,7 @@ func (s *TestSuiteCommon) TestGetPartialObjectMisAligned(c *check) {
 
 	// test Cases containing data to make partial range requests.
 	// also has expected response data.
-	testCases := []struct {
+	var testCases = []struct {
 		byteRange      string
 		expectedString string
 	}{
@@ -2449,7 +2440,7 @@ func (s *TestSuiteCommon) TestObjectMultipartListError(c *check) {
 	c.Assert(err, nil)
 	// Since max-keys parameter in the ListMultipart request set to invalid value of -2,
 	// its expected to fail with error message "InvalidArgument".
-	verifyError(c, response4, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive", http.StatusBadRequest)
+	verifyError(c, response4, "InvalidArgument", "Argument max-parts must be an integer between 0 and 2147483647", http.StatusBadRequest)
 }
 
 // TestObjectValidMD5 - First uploads an object with a valid Content-Md5 header and verifies the status,

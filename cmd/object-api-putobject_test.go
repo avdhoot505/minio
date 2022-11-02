@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -29,11 +28,11 @@ import (
 	"testing"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/internal/hash"
+	"github.com/minio/minio/pkg/hash"
 )
 
 func md5Header(data []byte) map[string]string {
-	return map[string]string{"etag": getMD5Hash(data)}
+	return map[string]string{"etag": getMD5Hash([]byte(data))}
 }
 
 // Wrapper for calling PutObject tests for both Erasure multiple disks and single node setup.
@@ -84,10 +83,8 @@ func testObjectAPIPutObject(obj ObjectLayer, instanceType string, t TestErrHandl
 		// Cases with invalid bucket name.
 		{".test", "obj", []byte(""), nil, "", 0, "", BucketNotFound{Bucket: ".test"}},
 		{"------", "obj", []byte(""), nil, "", 0, "", BucketNotFound{Bucket: "------"}},
-		{
-			"$this-is-not-valid-too", "obj", []byte(""), nil, "", 0, "",
-			BucketNotFound{Bucket: "$this-is-not-valid-too"},
-		},
+		{"$this-is-not-valid-too", "obj", []byte(""), nil, "", 0, "",
+			BucketNotFound{Bucket: "$this-is-not-valid-too"}},
 		{"a", "obj", []byte(""), nil, "", 0, "", BucketNotFound{Bucket: "a"}},
 
 		// Test case - 5.
@@ -100,43 +97,25 @@ func testObjectAPIPutObject(obj ObjectLayer, instanceType string, t TestErrHandl
 
 		// Test case - 7.
 		// Input to replicate Md5 mismatch.
-		{
-			bucket, object, []byte(""),
-			map[string]string{"etag": "d41d8cd98f00b204e9800998ecf8427f"},
-			"", 0, "",
-			hash.BadDigest{ExpectedMD5: "d41d8cd98f00b204e9800998ecf8427f", CalculatedMD5: "d41d8cd98f00b204e9800998ecf8427e"},
-		},
+		{bucket, object, []byte(""), map[string]string{"etag": "d41d8cd98f00b204e9800998ecf8427f"}, "", 0, "",
+			hash.BadDigest{ExpectedMD5: "d41d8cd98f00b204e9800998ecf8427f", CalculatedMD5: "d41d8cd98f00b204e9800998ecf8427e"}},
 
 		// Test case - 8.
 		// With incorrect sha256.
-		{
-			bucket, object, []byte("abcd"),
-			map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331f"},
+		{bucket, object, []byte("abcd"), map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331f"},
 			"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031580", int64(len("abcd")),
-			"",
-			hash.SHA256Mismatch{
-				ExpectedSHA256:   "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031580",
-				CalculatedSHA256: "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
-			},
-		},
+			"", hash.SHA256Mismatch{ExpectedSHA256: "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031580",
+				CalculatedSHA256: "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589"}},
 
 		// Test case - 9.
 		// Input with size more than the size of actual data inside the reader.
-		{
-			bucket, object, []byte("abcd"),
-			map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331e"},
-			"", int64(len("abcd") + 1), "",
-			hash.BadDigest{ExpectedMD5: "e2fc714c4727ee9395f324cd2e7f331e", CalculatedMD5: "e2fc714c4727ee9395f324cd2e7f331f"},
-		},
+		{bucket, object, []byte("abcd"), map[string]string{"etag": "e2fc714c4727ee9395f324cd2e7f331e"}, "", int64(len("abcd") + 1), "",
+			hash.BadDigest{ExpectedMD5: "e2fc714c4727ee9395f324cd2e7f331e", CalculatedMD5: "e2fc714c4727ee9395f324cd2e7f331f"}},
 
 		// Test case - 10.
 		// Input with size less than the size of actual data inside the reader.
-		{
-			bucket, object, []byte("abcd"),
-			map[string]string{"etag": "900150983cd24fb0d6963f7d28e17f73"},
-			"", int64(len("abcd") - 1), "",
-			hash.BadDigest{ExpectedMD5: "900150983cd24fb0d6963f7d28e17f73", CalculatedMD5: "900150983cd24fb0d6963f7d28e17f72"},
-		},
+		{bucket, object, []byte("abcd"), map[string]string{"etag": "900150983cd24fb0d6963f7d28e17f73"}, "", int64(len("abcd") - 1), "",
+			hash.BadDigest{ExpectedMD5: "900150983cd24fb0d6963f7d28e17f73", CalculatedMD5: "900150983cd24fb0d6963f7d28e17f72"}},
 
 		// Test case - 11-14.
 		// Validating for success cases.
@@ -165,18 +144,12 @@ func testObjectAPIPutObject(obj ObjectLayer, instanceType string, t TestErrHandl
 
 		// Test case 24-26.
 		// data with invalid md5sum in header
-		{
-			bucket, object, data, invalidMD5Header, "", int64(len(data)), getMD5Hash(data),
-			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(data)},
-		},
-		{
-			bucket, object, nilBytes, invalidMD5Header, "", int64(len(nilBytes)), getMD5Hash(nilBytes),
-			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(nilBytes)},
-		},
-		{
-			bucket, object, fiveMBBytes, invalidMD5Header, "", int64(len(fiveMBBytes)), getMD5Hash(fiveMBBytes),
-			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(fiveMBBytes)},
-		},
+		{bucket, object, data, invalidMD5Header, "", int64(len(data)), getMD5Hash(data),
+			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(data)}},
+		{bucket, object, nilBytes, invalidMD5Header, "", int64(len(nilBytes)), getMD5Hash(nilBytes),
+			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(nilBytes)}},
+		{bucket, object, fiveMBBytes, invalidMD5Header, "", int64(len(fiveMBBytes)), getMD5Hash(fiveMBBytes),
+			hash.BadDigest{ExpectedMD5: invalidMD5, CalculatedMD5: getMD5Hash(fiveMBBytes)}},
 
 		// Test case 27-29.
 		// data with size different from the actual number of bytes available in the reader
@@ -367,19 +340,8 @@ func testObjectAPIPutObjectStaleFiles(obj ObjectLayer, instanceType string, disk
 
 	for _, disk := range disks {
 		tmpMetaDir := path.Join(disk, minioMetaTmpBucket)
-		files, err := ioutil.ReadDir(tmpMetaDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var found bool
-		for _, fi := range files {
-			if fi.Name() == ".trash" {
-				continue
-			}
-			found = true
-		}
-		if found {
-			t.Fatalf("%s: expected: empty, got: non-empty %#v", minioMetaTmpBucket, files)
+		if !isDirEmpty(tmpMetaDir) {
+			t.Fatalf("%s: expected: empty, got: non-empty", minioMetaTmpBucket)
 		}
 	}
 }
@@ -456,17 +418,8 @@ func testObjectAPIMultipartPutObjectStaleFiles(obj ObjectLayer, instanceType str
 			t.Errorf("%s", err)
 		}
 
-		var found bool
-		for _, fi := range files {
-			if fi.Name() == ".trash" {
-				continue
-			}
-			found = true
-			break
-		}
-
-		if found {
-			t.Fatalf("%s: expected: empty, got: non-empty. content: %#v", tmpMetaDir, files)
+		if len(files) != 0 {
+			t.Fatalf("%s: expected: empty, got: non-empty. content: %s", tmpMetaDir, files)
 		}
 	}
 }
@@ -538,6 +491,7 @@ func BenchmarkPutObject10MbErasure(b *testing.B) {
 // BenchmarkPutObject25MbFS - Benchmark FS.PutObject() for object size of 25MB.
 func BenchmarkPutObject25MbFS(b *testing.B) {
 	benchmarkPutObject(b, "FS", 25*humanize.MiByte)
+
 }
 
 // BenchmarkPutObject25MbErasure - Benchmark Erasure.PutObject() for object size of 25MB.
@@ -620,6 +574,7 @@ func BenchmarkParallelPutObject10MbErasure(b *testing.B) {
 // BenchmarkParallelPutObject25MbFS - BenchmarkParallel FS.PutObject() for object size of 25MB.
 func BenchmarkParallelPutObject25MbFS(b *testing.B) {
 	benchmarkPutObjectParallel(b, "FS", 25*humanize.MiByte)
+
 }
 
 // BenchmarkParallelPutObject25MbErasure - BenchmarkParallel Erasure.PutObject() for object size of 25MB.

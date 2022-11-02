@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -26,7 +25,7 @@ import (
 	"testing"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/internal/hash"
+	"github.com/minio/minio/pkg/hash"
 )
 
 // Wrapper for calling NewMultipartUpload tests for both Erasure multiple disks and single node setup.
@@ -36,6 +35,7 @@ func TestObjectNewMultipartUpload(t *testing.T) {
 
 // Tests validate creation of new multipart upload instance.
 func testObjectNewMultipartUpload(obj ObjectLayer, instanceType string, t TestErrHandler) {
+
 	bucket := "minio-bucket"
 	object := "minio-object"
 	opts := ObjectOptions{}
@@ -84,6 +84,7 @@ func TestObjectAbortMultipartUpload(t *testing.T) {
 
 // Tests validate creation of abort multipart upload instance.
 func testObjectAbortMultipartUpload(obj ObjectLayer, instanceType string, t TestErrHandler) {
+
 	bucket := "minio-bucket"
 	object := "minio-object"
 	opts := ObjectOptions{}
@@ -205,10 +206,8 @@ func testObjectAPIPutObjectPart(obj ObjectLayer, instanceType string, t TestErrH
 		// Cases with invalid bucket name.
 		{".test", "obj", "", 1, "", "", "", 0, false, "", fmt.Errorf("%s", "Bucket not found: .test")},
 		{"------", "obj", "", 1, "", "", "", 0, false, "", fmt.Errorf("%s", "Bucket not found: ------")},
-		{
-			"$this-is-not-valid-too", "obj", "", 1, "", "", "", 0, false, "",
-			fmt.Errorf("%s", "Bucket not found: $this-is-not-valid-too"),
-		},
+		{"$this-is-not-valid-too", "obj", "", 1, "", "", "", 0, false, "",
+			fmt.Errorf("%s", "Bucket not found: $this-is-not-valid-too")},
 		{"a", "obj", "", 1, "", "", "", 0, false, "", fmt.Errorf("%s", "Bucket not found: a")},
 		// Test case - 5.
 		// Case with invalid object names.
@@ -238,31 +237,21 @@ func testObjectAPIPutObjectPart(obj ObjectLayer, instanceType string, t TestErrH
 		{bucket, "none-object", uploadID, 1, "", "", "", 0, false, "", fmt.Errorf("%s", "Invalid upload id "+uploadID)},
 		// Test case - 12.
 		// Input to replicate Md5 mismatch.
-		{
-			bucket, object, uploadID, 1, "", "d41d8cd98f00b204e9800998ecf8427f", "", 0, false, "",
-			hash.BadDigest{ExpectedMD5: "d41d8cd98f00b204e9800998ecf8427f", CalculatedMD5: "d41d8cd98f00b204e9800998ecf8427e"},
-		},
+		{bucket, object, uploadID, 1, "", "d41d8cd98f00b204e9800998ecf8427f", "", 0, false, "",
+			hash.BadDigest{ExpectedMD5: "d41d8cd98f00b204e9800998ecf8427f", CalculatedMD5: "d41d8cd98f00b204e9800998ecf8427e"}},
 		// Test case - 13.
 		// When incorrect sha256 is provided.
-		{
-			bucket, object, uploadID, 1, "", "", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b854", 0, false, "",
-			hash.SHA256Mismatch{
-				ExpectedSHA256:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b854",
-				CalculatedSHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-			},
-		},
+		{bucket, object, uploadID, 1, "", "", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b854", 0, false, "",
+			hash.SHA256Mismatch{ExpectedSHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b854",
+				CalculatedSHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}},
 		// Test case - 14.
 		// Input with size more than the size of actual data inside the reader.
-		{
-			bucket, object, uploadID, 1, "abcd", "e2fc714c4727ee9395f324cd2e7f3335", "", int64(len("abcd") + 1), false, "",
-			hash.BadDigest{ExpectedMD5: "e2fc714c4727ee9395f324cd2e7f3335", CalculatedMD5: "e2fc714c4727ee9395f324cd2e7f331f"},
-		},
+		{bucket, object, uploadID, 1, "abcd", "e2fc714c4727ee9395f324cd2e7f3335", "", int64(len("abcd") + 1), false, "",
+			hash.BadDigest{ExpectedMD5: "e2fc714c4727ee9395f324cd2e7f3335", CalculatedMD5: "e2fc714c4727ee9395f324cd2e7f331f"}},
 		// Test case - 15.
 		// Input with size less than the size of actual data inside the reader.
-		{
-			bucket, object, uploadID, 1, "abcd", "900150983cd24fb0d6963f7d28e17f73", "", int64(len("abcd") - 1), false, "",
-			hash.BadDigest{ExpectedMD5: "900150983cd24fb0d6963f7d28e17f73", CalculatedMD5: "900150983cd24fb0d6963f7d28e17f72"},
-		},
+		{bucket, object, uploadID, 1, "abcd", "900150983cd24fb0d6963f7d28e17f73", "", int64(len("abcd") - 1), false, "",
+			hash.BadDigest{ExpectedMD5: "900150983cd24fb0d6963f7d28e17f73", CalculatedMD5: "900150983cd24fb0d6963f7d28e17f72"}},
 
 		// Test case - 16-19.
 		// Validating for success cases.
@@ -305,6 +294,7 @@ func TestListMultipartUploads(t *testing.T) {
 
 // testListMultipartUploads - Tests validate listing of multipart uploads.
 func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHandler) {
+
 	bucketNames := []string{"minio-bucket", "minio-2-bucket", "minio-3-bucket"}
 	objectNames := []string{"minio-object-1.txt", "minio-object.txt", "neymar-1.jpeg", "neymar.jpeg", "parrot-1.png", "parrot.png"}
 	uploadIDs := []string{}
@@ -1037,22 +1027,13 @@ func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHan
 		{bucketNames[0], "", "", "", "-", 0, ListMultipartsInfo{Delimiter: "-"}, nil, true},
 		// Testing for failure cases with both perfix and marker (Test number 10).
 		// The prefix and marker combination to be valid it should satisfy strings.HasPrefix(marker, prefix).
-		{
-			bucketNames[0], "asia", "europe-object", "", "", 0,
-			ListMultipartsInfo{},
-			fmt.Errorf("Invalid combination of marker '%s' and prefix '%s'", "europe-object", "asia"), false,
-		},
+		{bucketNames[0], "asia", "europe-object", "", "", 0, ListMultipartsInfo{},
+			fmt.Errorf("Invalid combination of marker '%s' and prefix '%s'", "europe-object", "asia"), false},
 		// Setting an invalid combination of uploadIDMarker and Marker (Test number 11-12).
-		{
-			bucketNames[0], "asia", "asia/europe/", "abc", "", 0,
-			ListMultipartsInfo{},
-			fmt.Errorf("Invalid combination of uploadID marker '%s' and marker '%s'", "abc", "asia/europe/"), false,
-		},
-		{
-			bucketNames[0], "asia", "asia/europe", "abc", "", 0,
-			ListMultipartsInfo{},
-			fmt.Errorf("Malformed upload id %s", "abc"), false,
-		},
+		{bucketNames[0], "asia", "asia/europe/", "abc", "", 0, ListMultipartsInfo{},
+			fmt.Errorf("Invalid combination of uploadID marker '%s' and marker '%s'", "abc", "asia/europe/"), false},
+		{bucketNames[0], "asia", "asia/europe", "abc", "", 0, ListMultipartsInfo{},
+			fmt.Errorf("Malformed upload id %s", "abc"), false},
 
 		// Setting up valid case of ListMultiPartUploads.
 		// Test case with multiple parts for a single uploadID (Test number 13).
@@ -1083,7 +1064,7 @@ func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHan
 		{bucketNames[0], "Asia", "", "", "", 2, listMultipartResults[13], nil, true},
 		// setting delimiter (Test number 27).
 		{bucketNames[0], "", "", "", SlashSeparator, 2, listMultipartResults[14], nil, true},
-		// Test case with multiple uploadID listing for given object (Test number 28).
+		//Test case with multiple uploadID listing for given object (Test number 28).
 		{bucketNames[1], "", "", "", "", 100, listMultipartResults[15], nil, true},
 		// Test case with multiple uploadID listing for given object, but uploadID marker set.
 		// Testing whether the marker entry is skipped (Test number 29-30).
@@ -1106,29 +1087,29 @@ func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHan
 		// Test case with `Prefix` and `UploadIDMarker` (Test number 37).
 		{bucketNames[1], "min", "minio-object-1.txt", uploadIDs[1], "", 10, listMultipartResults[24], nil, true},
 		// Test case for bucket with multiple objects in it.
-		// Bucket used : `bucketNames[2]`.
-		// Objects used: `objectNames[1-5]`.
+		//	Bucket used : `bucketNames[2]`.
+		//	Objects used: `objectNames[1-5]`.
 		// UploadId's used: uploadIds[4-8].
 		// (Test number 39).
 		{bucketNames[2], "", "", "", "", 100, listMultipartResults[25], nil, true},
-		// Test cases with prefixes.
-		// Testing listing with prefix set to "min" (Test number 40)	.
+		//Test cases with prefixes.
+		//Testing listing with prefix set to "min" (Test number 40)	.
 		{bucketNames[2], "min", "", "", "", 100, listMultipartResults[26], nil, true},
-		// Testing listing with prefix set to "ney" (Test number 41).
+		//Testing listing with prefix set to "ney" (Test number 41).
 		{bucketNames[2], "ney", "", "", "", 100, listMultipartResults[27], nil, true},
-		// Testing listing with prefix set to "par" (Test number 42).
+		//Testing listing with prefix set to "par" (Test number 42).
 		{bucketNames[2], "parrot", "", "", "", 100, listMultipartResults[28], nil, true},
-		// Testing listing with prefix set to object name "neymar.jpeg" (Test number 43).
+		//Testing listing with prefix set to object name "neymar.jpeg" (Test number 43).
 		{bucketNames[2], "neymar.jpeg", "", "", "", 100, listMultipartResults[29], nil, true},
-		// Testing listing with `MaxUploads` set to 3 (Test number 44).
+		//	Testing listing with `MaxUploads` set to 3 (Test number 44).
 		{bucketNames[2], "", "", "", "", 3, listMultipartResults[30], nil, true},
 		// In case of bucketNames[2], there are 6 entries (Test number 45).
 		// Since all available entries are listed, IsTruncated is expected to be false
 		// and NextMarkers are expected to empty.
 		{bucketNames[2], "", "", "", "", 6, listMultipartResults[31], nil, true},
-		// Test case with `KeyMarker` (Test number 47).
+		//	Test case with `KeyMarker` (Test number 47).
 		{bucketNames[2], "", objectNames[3], "", "", 10, listMultipartResults[33], nil, true},
-		// Test case with `prefix` and `KeyMarker` (Test number 48).
+		//	Test case with `prefix` and `KeyMarker` (Test number 48).
 		{bucketNames[2], "minio-object", objectNames[1], "", "", 10, listMultipartResults[34], nil, true},
 	}
 
@@ -1177,6 +1158,7 @@ func TestListObjectPartsDiskNotFound(t *testing.T) {
 
 // testListObjectParts - Tests validate listing of object parts when disks go offline.
 func testListObjectPartsDiskNotFound(obj ObjectLayer, instanceType string, disks []string, t *testing.T) {
+
 	bucketNames := []string{"minio-bucket", "minio-2-bucket"}
 	objectNames := []string{"minio-object-1.txt"}
 	uploadIDs := []string{}
@@ -1421,6 +1403,7 @@ func TestListObjectParts(t *testing.T) {
 
 // testListObjectParts - test validate listing of object parts.
 func testListObjectParts(obj ObjectLayer, instanceType string, t TestErrHandler) {
+
 	bucketNames := []string{"minio-bucket", "minio-2-bucket"}
 	objectNames := []string{"minio-object-1.txt"}
 	uploadIDs := []string{}
@@ -1710,9 +1693,9 @@ func testObjectCompleteMultipartUpload(obj ObjectLayer, instanceType string, t T
 		{bucketNames[0], objectNames[0], uploadIDs[0], 3, "ijkl", "09a0877d04abf8759f99adec02baf579", int64(len("abcd"))},
 		{bucketNames[0], objectNames[0], uploadIDs[0], 4, "mnop", "e132e96a5ddad6da8b07bba6f6131fef", int64(len("abcd"))},
 		// Part with size larger than 5Mb.
-		{bucketNames[0], objectNames[0], uploadIDs[0], 5, string(validPart), validPartMD5, int64(len(validPart))},
-		{bucketNames[0], objectNames[0], uploadIDs[0], 6, string(validPart), validPartMD5, int64(len(validPart))},
-		{bucketNames[0], objectNames[0], uploadIDs[0], 7, string(validPart), validPartMD5, int64(len(validPart))},
+		{bucketNames[0], objectNames[0], uploadIDs[0], 5, string(validPart), validPartMD5, int64(len(string(validPart)))},
+		{bucketNames[0], objectNames[0], uploadIDs[0], 6, string(validPart), validPartMD5, int64(len(string(validPart)))},
+		{bucketNames[0], objectNames[0], uploadIDs[0], 7, string(validPart), validPartMD5, int64(len(string(validPart)))},
 	}
 	sha256sum := ""
 	var opts ObjectOptions
@@ -1835,6 +1818,7 @@ func testObjectCompleteMultipartUpload(obj ObjectLayer, instanceType string, t T
 			}
 			// Passes as expected, but asserting the results.
 			if actualErr == nil && testCase.shouldPass {
+
 				// Asserting IsTruncated.
 				if actualResult.ETag != testCase.expectedS3MD5 {
 					t.Errorf("%s: Expected the result to be \"%v\", but found it to \"%v\"", instanceType, testCase.expectedS3MD5, actualResult)
@@ -1871,6 +1855,7 @@ func BenchmarkPutObjectPart10MbErasure(b *testing.B) {
 // BenchmarkPutObjectPart25MbFS - Benchmark FS.PutObjectPart() for object size of 25MB.
 func BenchmarkPutObjectPart25MbFS(b *testing.B) {
 	benchmarkPutObjectPart(b, "FS", 25*humanize.MiByte)
+
 }
 
 // BenchmarkPutObjectPart25MbErasure - Benchmark Erasure.PutObjectPart() for object size of 25MB.

@@ -1,71 +1,66 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
-	"errors"
+	"crypto/tls"
 	"fmt"
 	"strings"
 	"sync"
 
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/config"
-	"github.com/minio/minio/internal/config/api"
-	"github.com/minio/minio/internal/config/cache"
-	"github.com/minio/minio/internal/config/compress"
-	"github.com/minio/minio/internal/config/dns"
-	"github.com/minio/minio/internal/config/etcd"
-	"github.com/minio/minio/internal/config/heal"
-	xldap "github.com/minio/minio/internal/config/identity/ldap"
-	"github.com/minio/minio/internal/config/identity/openid"
-	xtls "github.com/minio/minio/internal/config/identity/tls"
-	"github.com/minio/minio/internal/config/notify"
-	"github.com/minio/minio/internal/config/policy/opa"
-	"github.com/minio/minio/internal/config/scanner"
-	"github.com/minio/minio/internal/config/storageclass"
-	"github.com/minio/minio/internal/config/subnet"
-	"github.com/minio/minio/internal/crypto"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
+	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/config/api"
+	"github.com/minio/minio/cmd/config/cache"
+	"github.com/minio/minio/cmd/config/compress"
+	"github.com/minio/minio/cmd/config/crawler"
+	"github.com/minio/minio/cmd/config/dns"
+	"github.com/minio/minio/cmd/config/etcd"
+	"github.com/minio/minio/cmd/config/heal"
+	xldap "github.com/minio/minio/cmd/config/identity/ldap"
+	"github.com/minio/minio/cmd/config/identity/openid"
+	"github.com/minio/minio/cmd/config/notify"
+	"github.com/minio/minio/cmd/config/policy/opa"
+	"github.com/minio/minio/cmd/config/storageclass"
+	"github.com/minio/minio/cmd/crypto"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/cmd/logger/target/http"
+	"github.com/minio/minio/pkg/env"
+	"github.com/minio/minio/pkg/madmin"
 )
 
 func initHelp() {
-	kvs := map[string]config.KVS{
+	var kvs = map[string]config.KVS{
 		config.EtcdSubSys:           etcd.DefaultKVS,
 		config.CacheSubSys:          cache.DefaultKVS,
 		config.CompressionSubSys:    compress.DefaultKVS,
 		config.IdentityLDAPSubSys:   xldap.DefaultKVS,
 		config.IdentityOpenIDSubSys: openid.DefaultKVS,
-		config.IdentityTLSSubSys:    xtls.DefaultKVS,
 		config.PolicyOPASubSys:      opa.DefaultKVS,
-		config.SiteSubSys:           config.DefaultSiteKVS,
 		config.RegionSubSys:         config.DefaultRegionKVS,
 		config.APISubSys:            api.DefaultKVS,
 		config.CredentialsSubSys:    config.DefaultCredentialKVS,
-		config.LoggerWebhookSubSys:  logger.DefaultLoggerWebhookKVS,
-		config.AuditWebhookSubSys:   logger.DefaultAuditWebhookKVS,
-		config.AuditKafkaSubSys:     logger.DefaultAuditKafkaKVS,
+		config.KmsVaultSubSys:       crypto.DefaultVaultKVS,
+		config.KmsKesSubSys:         crypto.DefaultKesKVS,
+		config.LoggerWebhookSubSys:  logger.DefaultKVS,
+		config.AuditWebhookSubSys:   logger.DefaultAuditKVS,
 		config.HealSubSys:           heal.DefaultKVS,
-		config.ScannerSubSys:        scanner.DefaultKVS,
-		config.SubnetSubSys:         subnet.DefaultKVS,
+		config.CrawlerSubSys:        crawler.DefaultKVS,
 	}
 	for k, v := range notify.DefaultNotificationKVS {
 		kvs[k] = v
@@ -76,10 +71,10 @@ func initHelp() {
 	config.RegisterDefaultKVS(kvs)
 
 	// Captures help for each sub-system
-	helpSubSys := config.HelpKVS{
+	var helpSubSys = config.HelpKVS{
 		config.HelpKV{
-			Key:         config.SiteSubSys,
-			Description: "label the server and its location",
+			Key:         config.RegionSubSys,
+			Description: "label the location of the server",
 		},
 		config.HelpKV{
 			Key:         config.CacheSubSys,
@@ -102,12 +97,16 @@ func initHelp() {
 			Description: "enable LDAP SSO support",
 		},
 		config.HelpKV{
-			Key:         config.IdentityTLSSubSys,
-			Description: "enable X.509 TLS certificate SSO support",
-		},
-		config.HelpKV{
 			Key:         config.PolicyOPASubSys,
 			Description: "[DEPRECATED] enable external OPA for policy enforcement",
+		},
+		config.HelpKV{
+			Key:         config.KmsVaultSubSys,
+			Description: "enable external HashiCorp Vault key management service",
+		},
+		config.HelpKV{
+			Key:         config.KmsKesSubSys,
+			Description: "enable external MinIO key encryption service",
 		},
 		config.HelpKV{
 			Key:         config.APISubSys,
@@ -118,8 +117,8 @@ func initHelp() {
 			Description: "manage object healing frequency and bitrot verification checks",
 		},
 		config.HelpKV{
-			Key:         config.ScannerSubSys,
-			Description: "manage namespace scanning for usage calculation, lifecycle, healing and more",
+			Key:         config.CrawlerSubSys,
+			Description: "manage crawling for usage calculation, lifecycle, healing and more",
 		},
 		config.HelpKV{
 			Key:             config.LoggerWebhookSubSys,
@@ -129,11 +128,6 @@ func initHelp() {
 		config.HelpKV{
 			Key:             config.AuditWebhookSubSys,
 			Description:     "send audit logs to webhook endpoints",
-			MultipleTargets: true,
-		},
-		config.HelpKV{
-			Key:             config.AuditKafkaSubSys,
-			Description:     "send audit logs to kafka endpoints",
 			MultipleTargets: true,
 		},
 		config.HelpKV{
@@ -186,12 +180,6 @@ func initHelp() {
 			Description:     "publish bucket notifications to Redis datastores",
 			MultipleTargets: true,
 		},
-		config.HelpKV{
-			Key:         config.SubnetSubSys,
-			Type:        "string",
-			Description: "set subnet config for the cluster e.g. api key",
-			Optional:    true,
-		},
 	}
 
 	if globalIsErasure {
@@ -203,9 +191,8 @@ func initHelp() {
 		}
 	}
 
-	helpMap := map[string]config.HelpKVS{
+	var helpMap = map[string]config.HelpKVS{
 		"":                          helpSubSys, // Help for all sub-systems.
-		config.SiteSubSys:           config.SiteHelp,
 		config.RegionSubSys:         config.RegionHelp,
 		config.APISubSys:            api.Help,
 		config.StorageClassSubSys:   storageclass.Help,
@@ -213,14 +200,14 @@ func initHelp() {
 		config.CacheSubSys:          cache.Help,
 		config.CompressionSubSys:    compress.Help,
 		config.HealSubSys:           heal.Help,
-		config.ScannerSubSys:        scanner.Help,
+		config.CrawlerSubSys:        crawler.Help,
 		config.IdentityOpenIDSubSys: openid.Help,
 		config.IdentityLDAPSubSys:   xldap.Help,
-		config.IdentityTLSSubSys:    xtls.Help,
 		config.PolicyOPASubSys:      opa.Help,
+		config.KmsVaultSubSys:       crypto.HelpVault,
+		config.KmsKesSubSys:         crypto.HelpKes,
 		config.LoggerWebhookSubSys:  logger.Help,
-		config.AuditWebhookSubSys:   logger.HelpWebhook,
-		config.AuditKafkaSubSys:     logger.HelpKafka,
+		config.AuditWebhookSubSys:   logger.HelpAudit,
 		config.NotifyAMQPSubSys:     notify.HelpAMQP,
 		config.NotifyKafkaSubSys:    notify.HelpKafka,
 		config.NotifyMQTTSubSys:     notify.HelpMQTT,
@@ -231,20 +218,9 @@ func initHelp() {
 		config.NotifyRedisSubSys:    notify.HelpRedis,
 		config.NotifyWebhookSubSys:  notify.HelpWebhook,
 		config.NotifyESSubSys:       notify.HelpES,
-		config.SubnetSubSys:         subnet.HelpSubnet,
 	}
 
 	config.RegisterHelpSubSys(helpMap)
-
-	// save top-level help for deprecated sub-systems in a separate map.
-	deprecatedHelpKVMap := map[string]config.HelpKV{
-		config.RegionSubSys: {
-			Key:         config.RegionSubSys,
-			Description: "[DEPRECATED - use `site` instead] label the location of the server",
-		},
-	}
-
-	config.RegisterHelpDeprecatedSubSys(deprecatedHelpKVMap)
 }
 
 var (
@@ -253,55 +229,60 @@ var (
 	globalServerConfigMu sync.RWMutex
 )
 
-func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) error {
-	switch subSys {
-	case config.CredentialsSubSys:
-		if _, err := config.LookupCreds(s[config.CredentialsSubSys][config.Default]); err != nil {
-			return err
-		}
-	case config.SiteSubSys:
-		if _, err := config.LookupSite(s[config.SiteSubSys][config.Default], s[config.RegionSubSys][config.Default]); err != nil {
-			return err
-		}
-	case config.APISubSys:
-		if _, err := api.LookupConfig(s[config.APISubSys][config.Default]); err != nil {
-			return err
-		}
-	case config.StorageClassSubSys:
-		if globalIsErasure {
-			if objAPI == nil {
-				return errServerNotInitialized
-			}
-			for _, setDriveCount := range objAPI.SetDriveCounts() {
-				if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount); err != nil {
-					return err
-				}
-			}
-		}
-	case config.CacheSubSys:
-		if _, err := cache.LookupConfig(s[config.CacheSubSys][config.Default]); err != nil {
-			return err
-		}
-	case config.CompressionSubSys:
-		compCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
-		if err != nil {
-			return err
-		}
+func validateConfig(s config.Config, setDriveCounts []int) error {
+	// We must have a global lock for this so nobody else modifies env while we do.
+	defer env.LockSetEnv()()
 
-		if objAPI != nil {
-			if compCfg.Enabled && !objAPI.IsCompressionSupported() {
-				return fmt.Errorf("Backend does not support compression")
+	// Disable merging env values with config for validation.
+	env.SetEnvOff()
+
+	// Enable env values to validate KMS.
+	defer env.SetEnvOn()
+
+	if _, err := config.LookupCreds(s[config.CredentialsSubSys][config.Default]); err != nil {
+		return err
+	}
+
+	if _, err := config.LookupRegion(s[config.RegionSubSys][config.Default]); err != nil {
+		return err
+	}
+
+	if _, err := api.LookupConfig(s[config.APISubSys][config.Default]); err != nil {
+		return err
+	}
+
+	if globalIsErasure {
+		for _, setDriveCount := range setDriveCounts {
+			if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount); err != nil {
+				return err
 			}
 		}
-	case config.HealSubSys:
-		if _, err := heal.LookupConfig(s[config.HealSubSys][config.Default]); err != nil {
-			return err
+	}
+
+	if _, err := cache.LookupConfig(s[config.CacheSubSys][config.Default]); err != nil {
+		return err
+	}
+
+	compCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
+	if err != nil {
+		return err
+	}
+	objAPI := newObjectLayerFn()
+	if objAPI != nil {
+		if compCfg.Enabled && !objAPI.IsCompressionSupported() {
+			return fmt.Errorf("Backend does not support compression")
 		}
-	case config.ScannerSubSys:
-		if _, err := scanner.LookupConfig(s[config.ScannerSubSys][config.Default]); err != nil {
-			return err
-		}
-	case config.EtcdSubSys:
+	}
+
+	if _, err := heal.LookupConfig(s[config.HealSubSys][config.Default]); err != nil {
+		return err
+	}
+
+	if _, err := crawler.LookupConfig(s[config.CrawlerSubSys][config.Default]); err != nil {
+		return err
+	}
+
+	{
 		etcdCfg, err := etcd.LookupConfig(s[config.EtcdSubSys][config.Default], globalRootCAs)
 		if err != nil {
 			return err
@@ -313,13 +294,36 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 			}
 			etcdClnt.Close()
 		}
-	case config.IdentityOpenIDSubSys:
-		if _, err := openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
-			NewGatewayHTTPTransport(), xhttp.DrainBody, globalSite.Region); err != nil {
+	}
+	{
+		kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), newCustomHTTPTransportWithHTTP2(
+			&tls.Config{
+				RootCAs: globalRootCAs,
+			}, defaultDialTimeout)())
+		if err != nil {
 			return err
 		}
-	case config.IdentityLDAPSubSys:
-		cfg, err := xldap.Lookup(s[config.IdentityLDAPSubSys][config.Default], globalRootCAs)
+
+		// Set env to enable master key validation.
+		// this is needed only for KMS.
+		env.SetEnvOn()
+
+		if _, err = crypto.NewKMS(kmsCfg); err != nil {
+			return err
+		}
+
+		// Disable merging env values for the rest.
+		env.SetEnvOff()
+	}
+
+	if _, err := openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
+		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
+		return err
+	}
+
+	{
+		cfg, err := xldap.Lookup(s[config.IdentityLDAPSubSys][config.Default],
+			globalRootCAs)
 		if err != nil {
 			return err
 		}
@@ -330,61 +334,21 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 			}
 			conn.Close()
 		}
-	case config.IdentityTLSSubSys:
-		if _, err := xtls.Lookup(s[config.IdentityTLSSubSys][config.Default]); err != nil {
-			return err
-		}
-	case config.SubnetSubSys:
-		if _, err := subnet.LookupConfig(s[config.SubnetSubSys][config.Default]); err != nil {
-			return err
-		}
-	case config.PolicyOPASubSys:
-		if _, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
-			NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
-			return err
-		}
-	default:
-		if config.LoggerSubSystems.Contains(subSys) {
-			if err := logger.ValidateSubSysConfig(s, subSys); err != nil {
-				return err
-			}
-		}
 	}
 
-	if config.NotifySubSystems.Contains(subSys) {
-		if err := notify.TestSubSysNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), globalNotificationSys.ConfiguredTargetIDs(), subSys); err != nil {
-			return err
-		}
+	if _, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
+		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
+		return err
 	}
-	return nil
+
+	if _, err := logger.LookupConfig(s); err != nil {
+		return err
+	}
+
+	return notify.TestNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), globalNotificationSys.ConfiguredTargetIDs())
 }
 
-func validateConfig(s config.Config, subSys string) error {
-	objAPI := newObjectLayerFn()
-
-	// We must have a global lock for this so nobody else modifies env while we do.
-	defer env.LockSetEnv()()
-
-	// Disable merging env values with config for validation.
-	env.SetEnvOff()
-
-	// Enable env values to validate KMS.
-	defer env.SetEnvOn()
-	if subSys != "" {
-		return validateSubSysConfig(s, subSys, objAPI)
-	}
-
-	// No sub-system passed. Validate all of them.
-	for _, ss := range config.SubSystems.ToSlice() {
-		if err := validateSubSysConfig(s, ss, objAPI); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func lookupConfigs(s config.Config, objAPI ObjectLayer) {
+func lookupConfigs(s config.Config, setDriveCounts []int) {
 	ctx := GlobalContext
 
 	var err error
@@ -396,15 +360,7 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 		}
 	}
 
-	dnsURL, dnsUser, dnsPass, err := env.LookupEnv(config.EnvDNSWebhook)
-	if err != nil {
-		if globalIsGateway {
-			logger.FatalIf(err, "Unable to initialize remote webhook DNS config")
-		} else {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
-		}
-	}
-	if err == nil && dnsURL != "" {
+	if dnsURL, dnsUser, dnsPass, ok := env.LookupEnv(config.EnvDNSWebhook); ok {
 		globalDNSConfig, err = dns.NewOperatorDNS(dnsURL,
 			dns.Authentication(dnsUser, dnsPass),
 			dns.RootCAs(globalRootCAs))
@@ -469,9 +425,9 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 	// but not federation.
 	globalBucketFederation = etcdCfg.PathPrefix == "" && etcdCfg.Enabled
 
-	globalSite, err = config.LookupSite(s[config.SiteSubSys][config.Default], s[config.RegionSubSys][config.Default])
+	globalServerRegion, err = config.LookupRegion(s[config.RegionSubSys][config.Default])
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Invalid site configuration: %w", err))
+		logger.LogIf(ctx, fmt.Errorf("Invalid region configuration: %w", err))
 	}
 
 	apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
@@ -479,13 +435,14 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 		logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
 	}
 
+	globalAPIConfig.init(apiConfig, setDriveCounts)
+
 	// Initialize remote instance transport once.
 	getRemoteInstanceTransportOnce.Do(func() {
 		getRemoteInstanceTransport = newGatewayHTTPTransport(apiConfig.RemoteTransportDeadline)
 	})
 
-	if globalIsErasure && objAPI != nil {
-		setDriveCounts := objAPI.SetDriveCounts()
+	if globalIsErasure {
 		for i, setDriveCount := range setDriveCounts {
 			sc, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount)
 			if err != nil {
@@ -495,7 +452,7 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 			// if we validated all setDriveCounts and it was successful
 			// proceed to store the correct storage class globally.
 			if i == len(setDriveCounts)-1 {
-				globalStorageClass.Update(sc)
+				globalStorageClass = sc
 			}
 		}
 	}
@@ -510,30 +467,37 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 	}
 
 	if globalCacheConfig.Enabled {
-		if cacheEncKey := env.Get(cache.EnvCacheEncryptionKey, ""); cacheEncKey != "" {
-			globalCacheKMS, err = kms.Parse(cacheEncKey)
+		if cacheEncKey := env.Get(cache.EnvCacheEncryptionMasterKey, ""); cacheEncKey != "" {
+			globalCacheKMS, err = crypto.ParseMasterKey(cacheEncKey)
 			if err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to setup encryption cache: %w", err))
 			}
 		}
 	}
 
-	globalAutoEncryption = crypto.LookupAutoEncryption() // Enable auto-encryption if enabled
-	if globalAutoEncryption && GlobalKMS == nil {
-		logger.Fatal(errors.New("no KMS configured"), "MINIO_KMS_AUTO_ENCRYPTION requires a valid KMS configuration")
-	}
-
-	globalSTSTLSConfig, err = xtls.Lookup(s[config.IdentityTLSSubSys][config.Default])
+	kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), newCustomHTTPTransportWithHTTP2(
+		&tls.Config{
+			RootCAs: globalRootCAs,
+		}, defaultDialTimeout)())
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize X.509/TLS STS API: %w", err))
+		logger.LogIf(ctx, fmt.Errorf("Unable to setup KMS config: %w", err))
 	}
 
-	if globalSTSTLSConfig.InsecureSkipVerify {
-		logger.LogIf(ctx, fmt.Errorf("CRITICAL: enabling %s is not recommended in a production environment", xtls.EnvIdentityTLSSkipVerify))
+	GlobalKMS, err = crypto.NewKMS(kmsCfg)
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Unable to setup KMS with current KMS config: %w", err))
+	}
+	globalAutoEncryption = kmsCfg.AutoEncryption // Enable auto-encryption if enabled
+
+	if kmsCfg.Vault.Enabled {
+		const deprecationWarning = `Native Hashicorp Vault support is deprecated and will be removed on 2021-10-01. Please migrate to KES + Hashicorp Vault: https://github.com/minio/kes/wiki/Hashicorp-Vault-Keystore
+Note that native Hashicorp Vault and KES + Hashicorp Vault are not compatible.
+If you need help to migrate smoothly visit: https://min.io/pricing`
+		logger.LogIf(ctx, fmt.Errorf(deprecationWarning))
 	}
 
 	globalOpenIDConfig, err = openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
-		NewGatewayHTTPTransport(), xhttp.DrainBody, globalSite.Region)
+		NewGatewayHTTPTransport(), xhttp.DrainBody)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize OpenID: %w", err))
 	}
@@ -553,9 +517,48 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 		logger.LogIf(ctx, fmt.Errorf("Unable to parse LDAP configuration: %w", err))
 	}
 
-	globalSubnetConfig, err = subnet.LookupConfig(s[config.SubnetSubSys][config.Default])
+	// Load logger targets based on user's configuration
+	loggerUserAgent := getUserAgent(getMinioMode())
+
+	loggerCfg, err := logger.LookupConfig(s)
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to parse subnet configuration: %w", err))
+		logger.LogIf(ctx, fmt.Errorf("Unable to initialize logger: %w", err))
+	}
+
+	for k, l := range loggerCfg.HTTP {
+		if l.Enabled {
+			// Enable http logging
+			if err = logger.AddTarget(
+				http.New(
+					http.WithTargetName(k),
+					http.WithEndpoint(l.Endpoint),
+					http.WithAuthToken(l.AuthToken),
+					http.WithUserAgent(loggerUserAgent),
+					http.WithLogKind(string(logger.All)),
+					http.WithTransport(NewGatewayHTTPTransport()),
+				),
+			); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize console HTTP target: %w", err))
+			}
+		}
+	}
+
+	for k, l := range loggerCfg.Audit {
+		if l.Enabled {
+			// Enable http audit logging
+			if err = logger.AddAuditTarget(
+				http.New(
+					http.WithTargetName(k),
+					http.WithEndpoint(l.Endpoint),
+					http.WithAuthToken(l.AuthToken),
+					http.WithUserAgent(loggerUserAgent),
+					http.WithLogKind(string(logger.All)),
+					http.WithTransport(NewGatewayHTTPTransport()),
+				),
+			); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize audit HTTP target: %w", err))
+			}
+		}
 	}
 
 	globalConfigTargetList, err = notify.GetNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), false)
@@ -569,123 +572,66 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 	}
 
 	// Apply dynamic config values
-	if err := applyDynamicConfig(ctx, objAPI, s); err != nil {
-		if globalIsGateway {
-			logger.FatalIf(err, "Unable to initialize dynamic configuration")
-		} else {
-			logger.LogIf(ctx, err)
-		}
-	}
-}
-
-func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s config.Config, subSys string) error {
-	switch subSys {
-	case config.APISubSys:
-		apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
-		}
-		var setDriveCounts []int
-		if objAPI != nil {
-			setDriveCounts = objAPI.SetDriveCounts()
-		}
-		globalAPIConfig.init(apiConfig, setDriveCounts)
-	case config.CompressionSubSys:
-		cmpCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
-		if err != nil {
-			return fmt.Errorf("Unable to setup Compression: %w", err)
-		}
-		// Validate if the object layer supports compression.
-		if objAPI != nil {
-			if cmpCfg.Enabled && !objAPI.IsCompressionSupported() {
-				return fmt.Errorf("Backend does not support compression")
-			}
-		}
-		globalCompressConfigMu.Lock()
-		globalCompressConfig = cmpCfg
-		globalCompressConfigMu.Unlock()
-	case config.HealSubSys:
-		healCfg, err := heal.LookupConfig(s[config.HealSubSys][config.Default])
-		if err != nil {
-			return fmt.Errorf("Unable to apply heal config: %w", err)
-		}
-		globalHealConfig.Update(healCfg)
-	case config.ScannerSubSys:
-		scannerCfg, err := scanner.LookupConfig(s[config.ScannerSubSys][config.Default])
-		if err != nil {
-			return fmt.Errorf("Unable to apply scanner config: %w", err)
-		}
-		// update dynamic scanner values.
-		scannerCycle.Update(scannerCfg.Cycle)
-		logger.LogIf(ctx, scannerSleeper.Update(scannerCfg.Delay, scannerCfg.MaxWait))
-	case config.LoggerWebhookSubSys:
-		loggerCfg, err := logger.LookupConfigForSubSys(s, config.LoggerWebhookSubSys)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to load logger webhook config: %w", err))
-		}
-		userAgent := getUserAgent(getMinioMode())
-		for n, l := range loggerCfg.HTTP {
-			if l.Enabled {
-				l.LogOnce = logger.LogOnceIf
-				l.UserAgent = userAgent
-				l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
-				loggerCfg.HTTP[n] = l
-			}
-		}
-		err = logger.UpdateSystemTargets(loggerCfg)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to update logger webhook config: %w", err))
-		}
-	case config.AuditWebhookSubSys:
-		loggerCfg, err := logger.LookupConfigForSubSys(s, config.AuditWebhookSubSys)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to load audit webhook config: %w", err))
-		}
-		userAgent := getUserAgent(getMinioMode())
-		for n, l := range loggerCfg.AuditWebhook {
-			if l.Enabled {
-				l.LogOnce = logger.LogOnceIf
-				l.UserAgent = userAgent
-				l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
-				loggerCfg.AuditWebhook[n] = l
-			}
-		}
-
-		err = logger.UpdateAuditWebhookTargets(loggerCfg)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to update audit webhook targets: %w", err))
-		}
-	case config.AuditKafkaSubSys:
-		loggerCfg, err := logger.LookupConfigForSubSys(s, config.AuditKafkaSubSys)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to load audit kafka config: %w", err))
-		}
-		for n, l := range loggerCfg.AuditKafka {
-			if l.Enabled {
-				l.LogOnce = logger.LogOnceIf
-				loggerCfg.AuditKafka[n] = l
-			}
-		}
-		err = logger.UpdateAuditKafkaTargets(loggerCfg)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to update audit kafka targets: %w", err))
-		}
-	}
-	globalServerConfigMu.Lock()
-	defer globalServerConfigMu.Unlock()
-	if globalServerConfig != nil {
-		globalServerConfig[subSys] = s[subSys]
-	}
-	return nil
+	logger.LogIf(ctx, applyDynamicConfig(ctx, newObjectLayerFn(), s))
 }
 
 // applyDynamicConfig will apply dynamic config values.
 // Dynamic systems should be in config.SubSystemsDynamic as well.
 func applyDynamicConfig(ctx context.Context, objAPI ObjectLayer, s config.Config) error {
-	for subSys := range config.SubSystemsDynamic {
-		err := applyDynamicConfigForSubSys(ctx, objAPI, s, subSys)
-		if err != nil {
-			return err
+	if objAPI == nil {
+		return nil
+	}
+
+	// Read all dynamic configs.
+	// API
+	apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
+	}
+
+	// Compression
+	cmpCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
+	if err != nil {
+		return fmt.Errorf("Unable to setup Compression: %w", err)
+	}
+
+	// Validate if the object layer supports compression.
+	if cmpCfg.Enabled && !objAPI.IsCompressionSupported() {
+		return fmt.Errorf("Backend does not support compression")
+	}
+
+	// Heal
+	healCfg, err := heal.LookupConfig(s[config.HealSubSys][config.Default])
+	if err != nil {
+		return fmt.Errorf("Unable to apply heal config: %w", err)
+	}
+
+	// Crawler
+	crawlerCfg, err := crawler.LookupConfig(s[config.CrawlerSubSys][config.Default])
+	if err != nil {
+		return fmt.Errorf("Unable to apply crawler config: %w", err)
+	}
+
+	// Apply configurations.
+	// We should not fail after this.
+	globalAPIConfig.init(apiConfig, objAPI.SetDriveCounts())
+
+	globalCompressConfigMu.Lock()
+	globalCompressConfig = cmpCfg
+	globalCompressConfigMu.Unlock()
+
+	globalHealConfigMu.Lock()
+	globalHealConfig = healCfg
+	globalHealConfigMu.Unlock()
+
+	logger.LogIf(ctx, crawlerSleeper.Update(crawlerCfg.Delay, crawlerCfg.MaxWait))
+
+	// Update all dynamic config values in memory.
+	globalServerConfigMu.Lock()
+	defer globalServerConfigMu.Unlock()
+	if globalServerConfig != nil {
+		for k := range config.SubSystemsDynamic {
+			globalServerConfig[k] = s[k]
 		}
 	}
 	return nil
@@ -713,10 +659,7 @@ func GetHelp(subSys, key string, envOnly bool) (Help, error) {
 
 	subSysHelp, ok := config.HelpSubSysMap[""].Lookup(subSys)
 	if !ok {
-		subSysHelp, ok = config.HelpDeprecatedSubSysMap[subSys]
-		if !ok {
-			return Help{}, config.Errorf("unknown sub-system %s", subSys)
-		}
+		return Help{}, config.Errorf("unknown sub-system %s", subSys)
 	}
 
 	h, ok := config.HelpSubSysMap[subSys]
@@ -738,7 +681,9 @@ func GetHelp(subSys, key string, envOnly bool) (Help, error) {
 		// to list the ENV, for regular k/v EnableKey is
 		// implicit, for ENVs we cannot make it implicit.
 		if subSysHelp.MultipleTargets {
-			envK := config.EnvPrefix + strings.ToTitle(subSys) + config.EnvWordDelimiter + strings.ToTitle(madmin.EnableKey)
+			envK := config.EnvPrefix + strings.Join([]string{
+				strings.ToTitle(subSys), strings.ToTitle(madmin.EnableKey),
+			}, config.EnvWordDelimiter)
 			envHelp = append(envHelp, config.HelpKV{
 				Key:         envK,
 				Description: fmt.Sprintf("enable %s target, default is 'off'", subSys),
@@ -747,7 +692,9 @@ func GetHelp(subSys, key string, envOnly bool) (Help, error) {
 			})
 		}
 		for _, hkv := range h {
-			envK := config.EnvPrefix + strings.ToTitle(subSys) + config.EnvWordDelimiter + strings.ToTitle(hkv.Key)
+			envK := config.EnvPrefix + strings.Join([]string{
+				strings.ToTitle(subSys), strings.ToTitle(hkv.Key),
+			}, config.EnvWordDelimiter)
 			envHelp = append(envHelp, config.HelpKV{
 				Key:         envK,
 				Description: hkv.Description,
@@ -798,7 +745,7 @@ func loadConfig(objAPI ObjectLayer) error {
 	}
 
 	// Override any values from ENVs.
-	lookupConfigs(srvCfg, objAPI)
+	lookupConfigs(srvCfg, objAPI.SetDriveCounts())
 
 	// hold the mutex lock before a new config is assigned.
 	globalServerConfigMu.Lock()
@@ -815,8 +762,8 @@ func loadConfig(objAPI ObjectLayer) error {
 func getOpenIDValidators(cfg openid.Config) *openid.Validators {
 	validators := openid.NewValidators()
 
-	if cfg.Enabled {
-		validators.Add(&cfg)
+	if cfg.JWKS.URL != nil {
+		validators.Add(openid.NewJWT(cfg))
 	}
 
 	return validators

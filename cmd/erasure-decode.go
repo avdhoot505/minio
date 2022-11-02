@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -24,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/cmd/logger"
 )
 
 // Reads in parallel from readers.
@@ -32,6 +31,7 @@ type parallelReader struct {
 	readers       []io.ReaderAt
 	orgReaders    []io.ReaderAt
 	dataBlocks    int
+	errs          []error
 	offset        int64
 	shardSize     int64
 	shardFileSize int64
@@ -48,6 +48,7 @@ func newParallelReader(readers []io.ReaderAt, e Erasure, offset, totalLength int
 	return &parallelReader{
 		readers:       readers,
 		orgReaders:    readers,
+		errs:          make([]error, len(readers)),
 		dataBlocks:    e.dataBlocks,
 		offset:        (offset / e.blockSize) * e.ShardSize(),
 		shardSize:     e.ShardSize(),
@@ -117,8 +118,6 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 	}
 
 	readTriggerCh := make(chan bool, len(p.readers))
-	defer close(readTriggerCh) // close the channel upon return
-
 	for i := 0; i < p.dataBlocks; i++ {
 		// Setup read triggers for p.dataBlocks number of reads so that it reads in parallel.
 		readTriggerCh <- true
@@ -162,7 +161,7 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 			// For the last shard, the shardsize might be less than previous shard sizes.
 			// Hence the following statement ensures that the buffer size is reset to the right size.
 			p.buf[bufIdx] = p.buf[bufIdx][:p.shardSize]
-			n, err := rr.ReadAt(p.buf[bufIdx], p.offset)
+			_, err := rr.ReadAt(p.buf[bufIdx], p.offset)
 			if err != nil {
 				if errors.Is(err, errFileNotFound) {
 					atomic.StoreInt32(&missingPartsHeal, 1)
@@ -173,13 +172,14 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 				// This will be communicated upstream.
 				p.orgReaders[bufIdx] = nil
 				p.readers[i] = nil
+				p.errs[i] = err
 
 				// Since ReadAt returned error, trigger another read.
 				readTriggerCh <- true
 				return
 			}
 			newBufLK.Lock()
-			newBuf[bufIdx] = p.buf[bufIdx][:n]
+			newBuf[bufIdx] = p.buf[bufIdx]
 			newBufLK.Unlock()
 			// Since ReadAt returned success, there is no need to trigger another read.
 			readTriggerCh <- false
@@ -197,8 +197,7 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 		return newBuf, nil
 	}
 
-	// If we cannot decode, just return read quorum error.
-	return nil, errErasureReadQuorum
+	return nil, reduceReadQuorumErrs(context.Background(), p.errs, objectOpIgnoredErrs, p.dataBlocks)
 }
 
 // Decode reads from readers, reconstructs data if needed and writes the data to the writer.
@@ -281,52 +280,4 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 	}
 
 	return bytesWritten, derr
-}
-
-// Heal reads from readers, reconstruct shards and writes the data to the writers.
-func (e Erasure) Heal(ctx context.Context, writers []io.Writer, readers []io.ReaderAt, totalLength int64) (derr error) {
-	if len(writers) != e.parityBlocks+e.dataBlocks {
-		return errInvalidArgument
-	}
-
-	reader := newParallelReader(readers, e, 0, totalLength)
-
-	startBlock := int64(0)
-	endBlock := totalLength / e.blockSize
-	if totalLength%e.blockSize != 0 {
-		endBlock++
-	}
-
-	var bufs [][]byte
-	for block := startBlock; block < endBlock; block++ {
-		var err error
-		bufs, err = reader.Read(bufs)
-		if len(bufs) > 0 {
-			if errors.Is(err, errFileNotFound) || errors.Is(err, errFileCorrupt) {
-				if derr == nil {
-					derr = err
-				}
-			}
-		} else if err != nil {
-			return err
-		}
-
-		if err = e.DecodeDataAndParityBlocks(ctx, bufs); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
-
-		w := parallelWriter{
-			writers:     writers,
-			writeQuorum: 1,
-			errs:        make([]error, len(writers)),
-		}
-
-		if err = w.Write(ctx, bufs); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
-	}
-
-	return derr
 }

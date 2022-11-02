@@ -1,22 +1,20 @@
-//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd
 // +build linux darwin dragonfly freebsd netbsd openbsd
 
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -71,7 +69,7 @@ func TestIsValidUmaskVol(t *testing.T) {
 	}
 
 	// Get umask of the bits stored.
-	currentUmask := 0o777 - uint32(st.Mode().Perm())
+	currentUmask := 0777 - uint32(st.Mode().Perm())
 
 	// Verify if umask is correct.
 	if int(currentUmask) != testCase.expectedUmask {
@@ -114,7 +112,7 @@ func TestIsValidUmaskFile(t *testing.T) {
 	}
 
 	// CheckFile - stat the file.
-	if _, err := disk.StatInfoFile(context.Background(), testCase.volName, "hello-world.txt/"+xlStorageFormatFile, false); err != nil {
+	if err := disk.CheckFile(context.Background(), testCase.volName, "hello-world.txt"); err != nil {
 		t.Fatalf("Stat failed with %s expected to pass.", err)
 	}
 }

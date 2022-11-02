@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -30,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dustin/go-humanize"
+	humanize "github.com/dustin/go-humanize"
 )
 
 const (
@@ -61,8 +60,8 @@ func newPostPolicyBytesV4WithContentRange(credential, bucketName, objectKey stri
 		keyConditionStr, contentLengthCondStr, algorithmConditionStr, dateConditionStr, credentialConditionStr, uuidConditionStr)
 	retStr := "{"
 	retStr = retStr + expirationStr + ","
-	retStr += conditionStr
-	retStr += "}"
+	retStr = retStr + conditionStr
+	retStr = retStr + "}"
 
 	return []byte(retStr)
 }
@@ -89,8 +88,8 @@ func newPostPolicyBytesV4(credential, bucketName, objectKey string, expiration t
 	conditionStr := fmt.Sprintf(`"conditions":[%s, %s, %s, %s, %s, %s]`, bucketConditionStr, keyConditionStr, algorithmConditionStr, dateConditionStr, credentialConditionStr, uuidConditionStr)
 	retStr := "{"
 	retStr = retStr + expirationStr + ","
-	retStr += conditionStr
-	retStr += "}"
+	retStr = retStr + conditionStr
+	retStr = retStr + "}"
 
 	return []byte(retStr)
 }
@@ -108,8 +107,8 @@ func newPostPolicyBytesV2(bucketName, objectKey string, expiration time.Time) []
 	conditionStr := fmt.Sprintf(`"conditions":[%s, %s]`, bucketConditionStr, keyConditionStr)
 	retStr := "{"
 	retStr = retStr + expirationStr + ","
-	retStr += conditionStr
-	retStr += "}"
+	retStr = retStr + conditionStr
+	retStr = retStr + "}"
 
 	return []byte(retStr)
 }
@@ -267,16 +266,6 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			dates:              []interface{}{curTimePlus5Min.Format(iso8601TimeFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
 			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"],["eq", "$x-amz-meta-uuid", "1234"]]}`,
 		},
-		// Success case, big body.
-		{
-			objectName:         "test",
-			data:               bytes.Repeat([]byte("a"), 10<<20),
-			expectedRespStatus: http.StatusNoContent,
-			accessKey:          credentials.AccessKey,
-			secretKey:          credentials.SecretKey,
-			dates:              []interface{}{curTimePlus5Min.Format(iso8601TimeFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
-			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"],["eq", "$x-amz-meta-uuid", "1234"]]}`,
-		},
 		// Corrupted Base 64 result
 		{
 			objectName:         "test",
@@ -422,6 +411,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			t.Errorf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, rec.Code)
 		}
 	}
+
 }
 
 // Wrapper for calling TestPostPolicyBucketHandlerRedirect tests for both Erasure multiple disks and single node setup.
@@ -506,6 +496,7 @@ func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t
 	if rec.Header().Get("Location") != expectedLocation {
 		t.Errorf("Unexpected location, expected = %s, found = `%s`", rec.Header().Get("Location"), expectedLocation)
 	}
+
 }
 
 // postPresignSignatureV4 - presigned signature for PostPolicy requests.
@@ -581,8 +572,7 @@ func buildGenericPolicy(t time.Time, accessKey, region, bucketName, objectName s
 }
 
 func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []byte, accessKey, secretKey string, region string,
-	t time.Time, policy []byte, addFormData map[string]string, corruptedB64 bool, corruptedMultipart bool,
-) (*http.Request, error) {
+	t time.Time, policy []byte, addFormData map[string]string, corruptedB64 bool, corruptedMultipart bool) (*http.Request, error) {
 	// Get the user credential.
 	credStr := getCredentialString(accessKey, region, t)
 

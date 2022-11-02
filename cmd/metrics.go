@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2018-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -23,8 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -92,6 +90,7 @@ func (c *minioCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect is called by the Prometheus registry when collecting metrics.
 func (c *minioCollector) Collect(ch chan<- prometheus.Metric) {
+
 	// Expose MinIO's version information
 	minioVersionInfo.WithLabelValues(Version, CommitID).Set(1.0)
 
@@ -106,10 +105,6 @@ func (c *minioCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func nodeHealthMetricsPrometheus(ch chan<- prometheus.Metric) {
-	if globalIsGateway {
-		return
-	}
-
 	nodesUp, nodesDown := GetPeerOnlineCount()
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
@@ -183,7 +178,7 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Objects for which healing failed in current self healing run",
 				[]string{"mount_path", "volume_status"}, nil),
 			prometheus.GaugeValue,
-			float64(v), s[0], s[1],
+			float64(v), string(s[0]), string(s[1]),
 		)
 	}
 }
@@ -377,18 +372,6 @@ func httpMetricsPrometheus(ch chan<- prometheus.Metric) {
 			api,
 		)
 	}
-
-	for api, value := range httpStats.TotalS3Canceled.APIStats {
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName(s3Namespace, "canceled", "total"),
-				"Total number of client canceled s3 request in current MinIO server instance",
-				[]string{"api"}, nil),
-			prometheus.CounterValue,
-			float64(value),
-			api,
-		)
-	}
 }
 
 // collects network metrics for MinIO server in Prometheus specific format
@@ -436,7 +419,7 @@ func networkMetricsPrometheus(ch chan<- prometheus.Metric) {
 }
 
 // Populates prometheus with bucket usage metrics, this metrics
-// is only enabled if scanner is enabled.
+// is only enabled if crawler is enabled.
 func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 	objLayer := newObjectLayerFn()
 	// Service not initialized yet
@@ -452,13 +435,13 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 	if err != nil {
 		return
 	}
+
 	// data usage has not captured any data yet.
 	if dataUsageInfo.LastUpdate.IsZero() {
 		return
 	}
 
 	for bucket, usageInfo := range dataUsageInfo.BucketsUsage {
-		stat := getLatestReplicationStats(bucket, usageInfo)
 		// Total space used by bucket
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
@@ -480,11 +463,20 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		)
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
+				prometheus.BuildFQName("bucket", "replication", "pending_size"),
+				"Total capacity pending to be replicated",
+				[]string{"bucket"}, nil),
+			prometheus.GaugeValue,
+			float64(usageInfo.ReplicationPendingSize),
+			bucket,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc(
 				prometheus.BuildFQName("bucket", "replication", "failed_size"),
 				"Total capacity failed to replicate at least once",
 				[]string{"bucket"}, nil),
 			prometheus.GaugeValue,
-			float64(stat.FailedSize),
+			float64(usageInfo.ReplicationFailedSize),
 			bucket,
 		)
 		ch <- prometheus.MustNewConstMetric(
@@ -493,7 +485,7 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Total capacity replicated to destination",
 				[]string{"bucket"}, nil),
 			prometheus.GaugeValue,
-			float64(stat.ReplicatedSize),
+			float64(usageInfo.ReplicatedSize),
 			bucket,
 		)
 		ch <- prometheus.MustNewConstMetric(
@@ -502,16 +494,7 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Total capacity replicated to this instance",
 				[]string{"bucket"}, nil),
 			prometheus.GaugeValue,
-			float64(stat.ReplicaSize),
-			bucket,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName("bucket", "replication", "failed_count"),
-				"Total replication operations failed",
-				[]string{"bucket"}, nil),
-			prometheus.GaugeValue,
-			float64(stat.FailedCount),
+			float64(usageInfo.ReplicaSize),
 			bucket,
 		)
 		for k, v := range usageInfo.ObjectSizesHistogram {
@@ -538,12 +521,8 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	if globalIsGateway {
-		return
-	}
-
 	server := getLocalServerProperty(globalEndpoints, &http.Request{
-		Host: globalLocalNodeName,
+		Host: GetLocalPeer(globalEndpoints),
 	})
 
 	onlineDisks, offlineDisks := getOnlineOfflineDisksStats(server.Disks)
@@ -646,6 +625,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 }
 
 func metricsHandler() http.Handler {
+
 	registry := prometheus.NewRegistry()
 
 	err := registry.Register(minioVersionInfo)
@@ -669,25 +649,14 @@ func metricsHandler() http.Handler {
 				ErrorHandling: promhttp.ContinueOnError,
 			}),
 	)
+
 }
 
 // AuthMiddleware checks if the bearer token is valid and authorized.
 func AuthMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims, groups, owner, authErr := metricsRequestAuthenticate(r)
+		claims, _, authErr := webRequestAuthenticate(r)
 		if authErr != nil || !claims.VerifyIssuer("prometheus", true) {
-			w.WriteHeader(http.StatusForbidden)
-			return
-		}
-		// For authenticated users apply IAM policy.
-		if !globalIAMSys.IsAllowed(iampolicy.Args{
-			AccountName:     claims.AccessKey,
-			Groups:          groups,
-			Action:          iampolicy.PrometheusAdminAction,
-			ConditionValues: getConditionValues(r, "", claims.AccessKey, claims.Map()),
-			IsOwner:         owner,
-			Claims:          claims.Map(),
-		}) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}

@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2015, 2016 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -40,26 +39,46 @@ func registerDistErasureRouters(router *mux.Router, endpointServerPools Endpoint
 
 // List of some generic handlers which are applied for all incoming requests.
 var globalHandlers = []mux.MiddlewareFunc{
+	// filters HTTP headers which are treated as metadata and are reserved
+	// for internal use only.
+	filterReservedMetadata,
+	// Enforce rules specific for TLS requests
+	setSSETLSHandler,
 	// Auth handler verifies incoming authorization headers and
 	// routes them accordingly. Client receives a HTTP error for
 	// invalid/unsupported signatures.
-	//
-	// Validates all incoming requests to have a valid date header.
 	setAuthHandler,
+	// Validates all incoming URL resources, for invalid/unsupported
+	// resources client receives a HTTP error.
+	setIgnoreResourcesHandler,
+	// Validates all incoming requests to have a valid date header.
+	setTimeValidityHandler,
+	// Adds cache control for all browser requests.
+	setBrowserCacheControlHandler,
+	// Validates if incoming request is for restricted buckets.
+	setReservedBucketHandler,
 	// Redirect some pre-defined browser request paths to a static location prefix.
 	setBrowserRedirectHandler,
 	// Adds 'crossdomain.xml' policy handler to serve legacy flash clients.
 	setCrossDomainPolicy,
-	// Limits all body and header sizes to a maximum fixed limit
-	setRequestLimitHandler,
+	// Limits all header sizes to a maximum fixed limit
+	setRequestHeaderSizeLimitHandler,
+	// Limits all requests size to a maximum fixed limit
+	setRequestSizeLimitHandler,
 	// Network statistics
 	setHTTPStatsHandler,
 	// Validate all the incoming requests.
 	setRequestValidityHandler,
+	// Forward path style requests to actual host in a bucket federated setup.
+	setBucketForwardingHandler,
+	// set HTTP security headers such as Content-Security-Policy.
+	addSecurityHeaders,
 	// set x-amz-request-id header.
 	addCustomHeaders,
-	// Add bucket forwarding handler
-	setBucketForwardingHandler,
+	// add redirect handler to redirect
+	// requests when object layer is not
+	// initialized.
+	setRedirectHandler,
 	// Add new handlers here.
 }
 
@@ -74,8 +93,15 @@ func configureServerHandler(endpointServerPools EndpointServerPools) (http.Handl
 		registerDistErasureRouters(router, endpointServerPools)
 	}
 
+	// Register web router when its enabled.
+	if globalBrowserEnabled {
+		if err := registerWebRouter(router); err != nil {
+			return nil, err
+		}
+	}
+
 	// Add Admin router, all APIs are enabled in server mode.
-	registerAdminRouter(router, true)
+	registerAdminRouter(router, true, true)
 
 	// Add healthcheck router
 	registerHealthCheckRouter(router)

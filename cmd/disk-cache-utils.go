@@ -1,35 +1,35 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"container/list"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/minio/internal/etag"
+	"github.com/minio/minio/cmd/crypto"
 )
 
 // CacheStatusType - whether the request was served from cache.
@@ -108,9 +108,10 @@ func cacheControlOpts(o ObjectInfo) *cacheControl {
 
 	var headerVal string
 	for k, v := range m {
-		if strings.EqualFold(k, "cache-control") {
+		if strings.ToLower(k) == "cache-control" {
 			headerVal = v
 		}
+
 	}
 	if headerVal == "" {
 		return nil
@@ -232,88 +233,41 @@ func isCacheEncrypted(meta map[string]string) bool {
 
 // decryptCacheObjectETag tries to decrypt the ETag saved in encrypted format using the cache KMS
 func decryptCacheObjectETag(info *ObjectInfo) error {
+	// Directories are never encrypted.
 	if info.IsDir {
-		return nil // Directories are never encrypted.
+		return nil
+	}
+	encrypted := crypto.S3.IsEncrypted(info.UserDefined) && isCacheEncrypted(info.UserDefined)
+
+	switch {
+	case encrypted:
+		if globalCacheKMS == nil {
+			return errKMSNotConfigured
+		}
+		keyID, kmsKey, sealedKey, err := crypto.S3.ParseMetadata(info.UserDefined)
+
+		if err != nil {
+			return err
+		}
+		extKey, err := globalCacheKMS.UnsealKey(keyID, kmsKey, crypto.Context{info.Bucket: path.Join(info.Bucket, info.Name)})
+		if err != nil {
+			return err
+		}
+		var objectKey crypto.ObjectKey
+		if err = objectKey.Unseal(extKey, sealedKey, crypto.S3.String(), info.Bucket, info.Name); err != nil {
+			return err
+		}
+		etagStr := tryDecryptETag(objectKey[:], info.ETag, false)
+		// backend ETag was hex encoded before encrypting, so hex decode to get actual ETag
+		etag, err := hex.DecodeString(etagStr)
+		if err != nil {
+			return err
+		}
+		info.ETag = string(etag)
+		return nil
 	}
 
-	// Depending on the SSE type we handle ETags slightly
-	// differently. ETags encrypted with SSE-S3 must be
-	// decrypted first, since the client expects that
-	// a single-part SSE-S3 ETag is equal to the content MD5.
-	//
-	// For all other SSE types, the ETag is not the content MD5.
-	// Therefore, we don't decrypt but only format it.
-	switch kind, ok := crypto.IsEncrypted(info.UserDefined); {
-	case ok && kind == crypto.S3 && isCacheEncrypted(info.UserDefined):
-		ETag, err := etag.Parse(info.ETag)
-		if err != nil {
-			return err
-		}
-		if !ETag.IsEncrypted() {
-			info.ETag = ETag.Format().String()
-			return nil
-		}
-
-		key, err := crypto.S3.UnsealObjectKey(globalCacheKMS, info.UserDefined, info.Bucket, info.Name)
-		if err != nil {
-			return err
-		}
-		ETag, err = etag.Decrypt(key[:], ETag)
-		if err != nil {
-			return err
-		}
-		info.ETag = ETag.Format().String()
-	case ok && (kind == crypto.S3KMS || kind == crypto.SSEC) && isCacheEncrypted(info.UserDefined):
-		ETag, err := etag.Parse(info.ETag)
-		if err != nil {
-			return err
-		}
-		info.ETag = ETag.Format().String()
-	}
 	return nil
-}
-
-// decryptCacheObjectETag tries to decrypt the ETag saved in encrypted format using the cache KMS
-func decryptCachePartETags(c *cacheMeta) ([]string, error) {
-	// Depending on the SSE type we handle ETags slightly
-	// differently. ETags encrypted with SSE-S3 must be
-	// decrypted first, since the client expects that
-	// a single-part SSE-S3 ETag is equal to the content MD5.
-	//
-	// For all other SSE types, the ETag is not the content MD5.
-	// Therefore, we don't decrypt but only format it.
-	switch kind, ok := crypto.IsEncrypted(c.Meta); {
-	case ok && kind == crypto.S3 && isCacheEncrypted(c.Meta):
-		key, err := crypto.S3.UnsealObjectKey(globalCacheKMS, c.Meta, c.Bucket, c.Object)
-		if err != nil {
-			return nil, err
-		}
-		etags := make([]string, 0, len(c.PartETags))
-		for i := range c.PartETags {
-			ETag, err := etag.Parse(c.PartETags[i])
-			if err != nil {
-				return nil, err
-			}
-			ETag, err = etag.Decrypt(key[:], ETag)
-			if err != nil {
-				return nil, err
-			}
-			etags = append(etags, ETag.Format().String())
-		}
-		return etags, nil
-	case ok && (kind == crypto.S3KMS || kind == crypto.SSEC) && isCacheEncrypted(c.Meta):
-		etags := make([]string, 0, len(c.PartETags))
-		for i := range c.PartETags {
-			ETag, err := etag.Parse(c.PartETags[i])
-			if err != nil {
-				return nil, err
-			}
-			etags = append(etags, ETag.Format().String())
-		}
-		return etags, nil
-	default:
-		return c.PartETags, nil
-	}
 }
 
 func isMetadataSame(m1, m2 map[string]string) bool {
@@ -424,9 +378,6 @@ func (f *fileScorer) addFileWithObjInfo(objInfo ObjectInfo, hits int) {
 // Returns true if there still is a need to delete files (n+saveBytes >0),
 // false if no more bytes needs to be saved.
 func (f *fileScorer) adjustSaveBytes(n int64) bool {
-	if f == nil {
-		return false
-	}
 	if int64(f.saveBytes)+n <= 0 {
 		f.saveBytes = 0
 		f.trimQueue()
@@ -483,6 +434,22 @@ func (f *fileScorer) trimQueue() {
 	}
 }
 
+// fileObjInfos returns all queued file object infos
+func (f *fileScorer) fileObjInfos() []ObjectInfo {
+	res := make([]ObjectInfo, 0, f.queue.Len())
+	e := f.queue.Front()
+	for e != nil {
+		qfile := e.Value.(queuedFile)
+		res = append(res, ObjectInfo{
+			Name:      qfile.name,
+			Size:      int64(qfile.size),
+			VersionID: qfile.versionID,
+		})
+		e = e.Next()
+	}
+	return res
+}
+
 func (f *fileScorer) purgeFunc(p func(qfile queuedFile)) {
 	e := f.queue.Front()
 	for e != nil {
@@ -537,51 +504,4 @@ func bytesToClear(total, free int64, quotaPct, lowWatermark, highWatermark uint6
 	// Return bytes needed to reach low watermark.
 	lowWMUsage := total * (int64)(lowWatermark*quotaPct) / (100 * 100)
 	return (uint64)(math.Min(float64(quotaAllowed), math.Max(0.0, float64(used-lowWMUsage))))
-}
-
-type multiWriter struct {
-	backendWriter io.Writer
-	cacheWriter   *io.PipeWriter
-	pipeClosed    bool
-}
-
-// multiWriter writes to backend and cache - if cache write
-// fails close the pipe, but continue writing to the backend
-func (t *multiWriter) Write(p []byte) (n int, err error) {
-	n, err = t.backendWriter.Write(p)
-	if err == nil && n != len(p) {
-		err = io.ErrShortWrite
-		return
-	}
-	if err != nil {
-		if !t.pipeClosed {
-			t.cacheWriter.CloseWithError(err)
-		}
-		return
-	}
-
-	// ignore errors writing to cache
-	if !t.pipeClosed {
-		_, cerr := t.cacheWriter.Write(p)
-		if cerr != nil {
-			t.pipeClosed = true
-			t.cacheWriter.CloseWithError(cerr)
-		}
-	}
-	return len(p), nil
-}
-
-func cacheMultiWriter(w1 io.Writer, w2 *io.PipeWriter) io.Writer {
-	return &multiWriter{backendWriter: w1, cacheWriter: w2}
-}
-
-// writebackInProgress returns true if writeback commit is not complete
-func writebackInProgress(m map[string]string) bool {
-	if v, ok := m[writeBackStatusHeader]; ok {
-		switch cacheCommitStatus(v) {
-		case CommitPending, CommitFailed:
-			return true
-		}
-	}
-	return false
 }

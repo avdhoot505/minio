@@ -44,13 +44,10 @@ Example: Start MinIO server in a 12 drives setup, using MinIO binary.
 minio server /data{1...12}
 ```
 
-Example: Start MinIO server in a 8 drives setup, using MinIO Docker image.
+Example: Start MinIO server in a 8 drives setup, using MinIO Docker image. 
 
 ```sh
-podman run \
-  -p 9000:9000 \
-  -p 9001:9001 \
-  --name minio \
+docker run -p 9000:9000 --name minio \
   -v /mnt/data1:/data1 \
   -v /mnt/data2:/data2 \
   -v /mnt/data3:/data3 \
@@ -59,7 +56,7 @@ podman run \
   -v /mnt/data6:/data6 \
   -v /mnt/data7:/data7 \
   -v /mnt/data8:/data8 \
-  quay.io/minio/minio server /data{1...8} --console-address ":9001"
+  minio/minio server /data{1...8}
 ```
 
 ### 3. Test your setup

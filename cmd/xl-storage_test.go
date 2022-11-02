@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -31,7 +30,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/google/uuid"
+	"github.com/minio/minio/cmd/config/storageclass"
 )
 
 func TestCheckPathLength(t *testing.T) {
@@ -128,15 +127,12 @@ func newXLStorageTestSetup() (*xlStorageDiskIDCheck, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-
 	// Create a sample format.json file
-	if err = storage.WriteAll(context.Background(), minioMetaBucket, formatConfigFile, []byte(`{"version":"1","format":"xl","id":"592a41c2-b7cc-4130-b883-c4b5cb15965b","xl":{"version":"3","this":"da017d62-70e3-45f1-8a1a-587707e69ad1","sets":[["e07285a6-8c73-4962-89c6-047fb939f803","33b8d431-482d-4376-b63c-626d229f0a29","cff6513a-4439-4dc1-bcaa-56c9e880c352","da017d62-70e3-45f1-8a1a-587707e69ad1","9c9f21d5-1f15-4737-bce6-835faa0d9626","0a59b346-1424-4fc2-9fa2-a2e80541d0c1","7924a3dc-b69a-4971-9a2e-014966d6aebb","4d2b8dd9-4e48-444b-bdca-c89194b26042"]],"distributionAlgo":"CRCMOD"}}`)); err != nil {
+	err = storage.WriteAll(context.Background(), minioMetaBucket, formatConfigFile, []byte(`{"version":"1","format":"xl","id":"592a41c2-b7cc-4130-b883-c4b5cb15965b","xl":{"version":"3","this":"da017d62-70e3-45f1-8a1a-587707e69ad1","sets":[["e07285a6-8c73-4962-89c6-047fb939f803","33b8d431-482d-4376-b63c-626d229f0a29","cff6513a-4439-4dc1-bcaa-56c9e880c352","da017d62-70e3-45f1-8a1a-587707e69ad1","9c9f21d5-1f15-4737-bce6-835faa0d9626","0a59b346-1424-4fc2-9fa2-a2e80541d0c1","7924a3dc-b69a-4971-9a2e-014966d6aebb","4d2b8dd9-4e48-444b-bdca-c89194b26042"]],"distributionAlgo":"CRCMOD"}}`))
+	if err != nil {
 		return nil, "", err
 	}
-
-	disk := newXLStorageDiskIDCheck(storage)
-	disk.SetDiskID("da017d62-70e3-45f1-8a1a-587707e69ad1")
-	return disk, diskPath, nil
+	return &xlStorageDiskIDCheck{storage: storage, diskID: "da017d62-70e3-45f1-8a1a-587707e69ad1"}, diskPath, nil
 }
 
 // createPermDeniedFile - creates temporary directory and file with path '/mybucket/myobject'
@@ -161,22 +157,22 @@ func createPermDeniedFile(t *testing.T) (permDeniedDir string) {
 		return permDeniedDir
 	}
 
-	if err = os.Mkdir(slashpath.Join(permDeniedDir, "mybucket"), 0o775); err != nil {
+	if err = os.Mkdir(slashpath.Join(permDeniedDir, "mybucket"), 0775); err != nil {
 		errMsg = fmt.Sprintf("Unable to create temporary directory %v. %v", slashpath.Join(permDeniedDir, "mybucket"), err)
 		return permDeniedDir
 	}
 
-	if err = ioutil.WriteFile(slashpath.Join(permDeniedDir, "mybucket", "myobject"), []byte(""), 0o400); err != nil {
+	if err = ioutil.WriteFile(slashpath.Join(permDeniedDir, "mybucket", "myobject"), []byte(""), 0400); err != nil {
 		errMsg = fmt.Sprintf("Unable to create file %v. %v", slashpath.Join(permDeniedDir, "mybucket", "myobject"), err)
 		return permDeniedDir
 	}
 
-	if err = os.Chmod(slashpath.Join(permDeniedDir, "mybucket"), 0o400); err != nil {
+	if err = os.Chmod(slashpath.Join(permDeniedDir, "mybucket"), 0400); err != nil {
 		errMsg = fmt.Sprintf("Unable to change permission to temporary directory %v. %v", slashpath.Join(permDeniedDir, "mybucket"), err)
 		return permDeniedDir
 	}
 
-	if err = os.Chmod(permDeniedDir, 0o400); err != nil {
+	if err = os.Chmod(permDeniedDir, 0400); err != nil {
 		errMsg = fmt.Sprintf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 	}
 
@@ -185,8 +181,8 @@ func createPermDeniedFile(t *testing.T) (permDeniedDir string) {
 
 // removePermDeniedFile - removes temporary directory and file with path '/mybucket/myobject'
 func removePermDeniedFile(permDeniedDir string) {
-	if err := os.Chmod(permDeniedDir, 0o775); err == nil {
-		if err = os.Chmod(slashpath.Join(permDeniedDir, "mybucket"), 0o775); err == nil {
+	if err := os.Chmod(permDeniedDir, 0775); err == nil {
+		if err = os.Chmod(slashpath.Join(permDeniedDir, "mybucket"), 0775); err == nil {
 			os.RemoveAll(permDeniedDir)
 		}
 	}
@@ -231,7 +227,7 @@ func TestXLStorageIsDirEmpty(t *testing.T) {
 
 	// Should give false for not-a-directory.
 	dir2 := slashpath.Join(tmp, "file")
-	err = ioutil.WriteFile(dir2, []byte("hello"), 0o777)
+	err = ioutil.WriteFile(dir2, []byte("hello"), 0777)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,43 +238,13 @@ func TestXLStorageIsDirEmpty(t *testing.T) {
 
 	// Should give true for a real empty directory.
 	dir3 := slashpath.Join(tmp, "empty")
-	err = os.Mkdir(dir3, 0o777)
+	err = os.Mkdir(dir3, 0777)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if !isDirEmpty(dir3) {
 		t.Error("expected true for empty dir, got false")
-	}
-}
-
-func TestXLStorageReadVersionLegacy(t *testing.T) {
-	const legacyJSON = `{"version":"1.0.1","format":"xl","stat":{"size":2016,"modTime":"2021-10-11T23:40:34.914361617Z"},"erasure":{"algorithm":"klauspost/reedsolomon/vandermonde","data":2,"parity":2,"blockSize":10485760,"index":2,"distribution":[2,3,4,1],"checksum":[{"name":"part.1","algorithm":"highwayhash256S"}]},"minio":{"release":"RELEASE.2019-12-30T05-45-39Z"},"meta":{"X-Minio-Internal-Server-Side-Encryption-Iv":"kInsJB/0yxyz/40ZI+lmQYJfZacDYqZsGh2wEiv+N50=","X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id":"my-minio-key","X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key":"eyJhZWFkIjoiQUVTLTI1Ni1HQ00tSE1BQy1TSEEtMjU2IiwiaWQiOiJjMzEwNDVjODFmMTA2MWU5NTI4ODcxZmNhMmRkYzA3YyIsIml2IjoiOWQ5cUxGMFhSaFBXbEVqT2JDMmo0QT09Iiwibm9uY2UiOiJYaERsemlCU1cwSENuK2RDIiwiYnl0ZXMiOiJUM0lmY1haQ1dtMWpLeWxBWmFUUnczbDVoYldLWW95dm5iNTZVaWJEbE5LOFZVU2tuQmx3NytIMG8yZnRzZ1UrIn0=","X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key":"IAAfANqt801MT+wwzQRkfFhTrndmhfNiN0alKwDS4AQ1dznNADRQgoq6I4pPVfRsbDp5rQawlripQZvPWUSNJA==","X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm":"DAREv2-HMAC-SHA256","content-type":"application/octet-stream","etag":"20000f00cf5e68d3d6b60e44fcd8b9e8-1"},"parts":[{"number":1,"name":"part.1","etag":"","size":2016,"actualSize":1984}]}`
-
-	// create xlStorage test setup
-	xlStorage, path, err := newXLStorageTestSetup()
-	if err != nil {
-		t.Fatalf("Unable to cfgreate xlStorage test setup, %s", err)
-	}
-
-	defer os.RemoveAll(path)
-
-	// Create files for the test cases.
-	if err = xlStorage.MakeVol(context.Background(), "exists-legacy"); err != nil {
-		t.Fatalf("Unable to create a volume \"exists-legacy\", %s", err)
-	}
-
-	if err = xlStorage.AppendFile(context.Background(), "exists-legacy", "as-file/xl.json", []byte(legacyJSON)); err != nil {
-		t.Fatalf("Unable to create a file \"as-file\", %s", err)
-	}
-
-	fi, err := xlStorage.ReadVersion(context.Background(), "exists-legacy", "as-file", "", false)
-	if err != nil {
-		t.Fatalf("Unable to read older 'xl.json' content: %s", err)
-	}
-
-	if !fi.XLV1 {
-		t.Fatal("Unexpected 'xl.json' content should be correctly interpreted as legacy content")
 	}
 }
 
@@ -446,11 +412,10 @@ func TestXLStorageReadAll(t *testing.T) {
 	for i, testCase := range testCases {
 		dataRead, err = xlStorage.ReadAll(context.Background(), testCase.volume, testCase.path)
 		if err != testCase.err {
-			t.Errorf("TestXLStorage %d: Expected err \"%v\", got err \"%v\"", i+1, testCase.err, err)
-			continue
+			t.Fatalf("TestXLStorage %d: Expected err \"%s\", got err \"%s\"", i+1, testCase.err, err)
 		}
 		if err == nil {
-			if !bytes.Equal(dataRead, []byte("Hello, World")) {
+			if string(dataRead) != string([]byte("Hello, World")) {
 				t.Errorf("TestXLStorage %d: Expected the data read to be \"%s\", but instead got \"%s\"", i+1, "Hello, World", string(dataRead))
 			}
 		}
@@ -517,7 +482,7 @@ func TestXLStorageMakeVol(t *testing.T) {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 	// Create a directory.
-	if err := os.Mkdir(slashpath.Join(path, "existing-vol"), 0o777); err != nil {
+	if err := os.Mkdir(slashpath.Join(path, "existing-vol"), 0777); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
@@ -563,7 +528,7 @@ func TestXLStorageMakeVol(t *testing.T) {
 			t.Fatalf("Unable to create temporary directory. %v", err)
 		}
 		defer os.RemoveAll(permDeniedDir)
-		if err = os.Chmod(permDeniedDir, 0o400); err != nil {
+		if err = os.Chmod(permDeniedDir, 0400); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -573,7 +538,7 @@ func TestXLStorageMakeVol(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = os.Chmod(permDeniedDir, 0o755); err != nil {
+		if err = os.Chmod(permDeniedDir, 0755); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -583,7 +548,7 @@ func TestXLStorageMakeVol(t *testing.T) {
 		}
 
 		// change backend permissions for MakeVol error.
-		if err = os.Chmod(permDeniedDir, 0o400); err != nil {
+		if err = os.Chmod(permDeniedDir, 0400); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -609,7 +574,7 @@ func TestXLStorageDeleteVol(t *testing.T) {
 
 	// TestXLStorage failure cases.
 	vol := slashpath.Join(path, "nonempty-vol")
-	if err = os.Mkdir(vol, 0o777); err != nil {
+	if err = os.Mkdir(vol, 0777); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 	if err = ioutil.WriteFile(slashpath.Join(vol, "test-file"), []byte{}, os.ModePerm); err != nil {
@@ -659,10 +624,10 @@ func TestXLStorageDeleteVol(t *testing.T) {
 			t.Fatalf("Unable to create temporary directory. %v", err)
 		}
 		defer removePermDeniedFile(permDeniedDir)
-		if err = os.Mkdir(slashpath.Join(permDeniedDir, "mybucket"), 0o400); err != nil {
+		if err = os.Mkdir(slashpath.Join(permDeniedDir, "mybucket"), 0400); err != nil {
 			t.Fatalf("Unable to create temporary directory %v. %v", slashpath.Join(permDeniedDir, "mybucket"), err)
 		}
-		if err = os.Chmod(permDeniedDir, 0o400); err != nil {
+		if err = os.Chmod(permDeniedDir, 0400); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -672,7 +637,7 @@ func TestXLStorageDeleteVol(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = os.Chmod(permDeniedDir, 0o755); err != nil {
+		if err = os.Chmod(permDeniedDir, 0755); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -682,7 +647,7 @@ func TestXLStorageDeleteVol(t *testing.T) {
 		}
 
 		// change backend permissions for MakeVol error.
-		if err = os.Chmod(permDeniedDir, 0o400); err != nil {
+		if err = os.Chmod(permDeniedDir, 0400); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -902,7 +867,7 @@ func TestXLStorageListDir(t *testing.T) {
 		var dirList []string
 		dirList, err = xlStorage.ListDir(context.Background(), testCase.srcVol, testCase.srcPath, -1)
 		if err != testCase.expectedErr {
-			t.Errorf("TestXLStorage case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
+			t.Fatalf("TestXLStorage case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
 		if err == nil {
 			for _, expected := range testCase.expectedListDir {
@@ -924,7 +889,7 @@ func TestXLStorageListDir(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = os.Chmod(permDeniedDir, 0o755); err != nil {
+		if err = os.Chmod(permDeniedDir, 0755); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -933,8 +898,8 @@ func TestXLStorageListDir(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = xlStorageNew.Delete(context.Background(), "mybucket", "myobject", false); err != errVolumeAccessDenied {
-			t.Errorf("expected: %s, got: %s", errVolumeAccessDenied, err)
+		if err = xlStorageNew.Delete(context.Background(), "mybucket", "myobject", false); err != errFileAccessDenied {
+			t.Errorf("expected: %s, got: %s", errFileAccessDenied, err)
 		}
 	}
 
@@ -948,10 +913,6 @@ func TestXLStorageListDir(t *testing.T) {
 
 // TestXLStorageDeleteFile - Series of test cases construct valid and invalid input data and validates the result and the error response.
 func TestXLStorageDeleteFile(t *testing.T) {
-	if runtime.GOOS == globalWindowsOSName {
-		t.Skip()
-	}
-
 	// create xlStorage test setup
 	xlStorage, path, err := newXLStorageTestSetup()
 	if err != nil {
@@ -981,7 +942,7 @@ func TestXLStorageDeleteFile(t *testing.T) {
 		t.Fatalf("Unable to create file, %s", err.Error())
 	}
 	// Parent directory must have write permissions, this is read + execute.
-	if err = os.Chmod(pathJoin(path, "no-permissions"), 0o555); err != nil {
+	if err = os.Chmod(pathJoin(path, "no-permissions"), 0555); err != nil {
 		t.Fatalf("Unable to chmod directory, %s", err.Error())
 	}
 
@@ -998,11 +959,11 @@ func TestXLStorageDeleteFile(t *testing.T) {
 			expectedErr: nil,
 		},
 		// TestXLStorage case - 2.
-		// The file was deleted in the last  case, so Delete should not fail.
+		// The file was deleted in the last  case, so Delete should fail.
 		{
 			srcVol:      "success-vol",
 			srcPath:     "success-file",
-			expectedErr: nil,
+			expectedErr: errFileNotFound,
 		},
 		// TestXLStorage case - 3.
 		// TestXLStorage case with segment of the volume name > 255.
@@ -1031,7 +992,7 @@ func TestXLStorageDeleteFile(t *testing.T) {
 		{
 			srcVol:      "no-permissions",
 			srcPath:     "dir/file",
-			expectedErr: errVolumeAccessDenied,
+			expectedErr: nil,
 		},
 	}
 
@@ -1052,7 +1013,7 @@ func TestXLStorageDeleteFile(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = os.Chmod(permDeniedDir, 0o755); err != nil {
+		if err = os.Chmod(permDeniedDir, 0755); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -1061,8 +1022,8 @@ func TestXLStorageDeleteFile(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = xlStorageNew.Delete(context.Background(), "mybucket", "myobject", false); err != errVolumeAccessDenied {
-			t.Errorf("expected: %s, got: %s", errVolumeAccessDenied, err)
+		if err = xlStorageNew.Delete(context.Background(), "mybucket", "myobject", false); err != errFileAccessDenied {
+			t.Errorf("expected: %s, got: %s", errFileAccessDenied, err)
 		}
 	}
 
@@ -1090,7 +1051,7 @@ func TestXLStorageReadFile(t *testing.T) {
 	}
 
 	// Create directory to make errIsNotRegular
-	if err = os.Mkdir(slashpath.Join(path, "success-vol", "object-as-dir"), 0o777); err != nil {
+	if err = os.Mkdir(slashpath.Join(path, "success-vol", "object-as-dir"), 0777); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
@@ -1115,18 +1076,15 @@ func TestXLStorageReadFile(t *testing.T) {
 		// Object is a directory. - 3
 		{
 			volume, "object-as-dir",
-			0, 5, nil, errIsNotRegular,
-		},
+			0, 5, nil, errIsNotRegular},
 		// One path segment length is > 255 chars long. - 4
 		{
 			volume, "path/to/my/object0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
-			0, 5, nil, errFileNameTooLong,
-		},
+			0, 5, nil, errFileNameTooLong},
 		// Path length is > 1024 chars long. - 5
 		{
 			volume, "level0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001/level0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002/level0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003/object000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
-			0, 5, nil, errFileNameTooLong,
-		},
+			0, 5, nil, errFileNameTooLong},
 		// Buffer size greater than object size. - 6
 		{
 			volume, "myobject", 0, 16,
@@ -1187,11 +1145,15 @@ func TestXLStorageReadFile(t *testing.T) {
 	}
 
 	for l := 0; l < 2; l++ {
+		// 1st loop tests with dma=write, 2nd loop tests with dma=read-write.
+		if l == 1 {
+			globalStorageClass.DMA = storageclass.DMAReadWrite
+		}
 		// Following block validates all ReadFile test cases.
 		for i, testCase := range testCases {
 			var n int64
 			// Common read buffer.
-			buf := make([]byte, testCase.bufSize)
+			var buf = make([]byte, testCase.bufSize)
 			n, err = xlStorage.ReadFile(context.Background(), testCase.volume, testCase.fileName, testCase.offset, buf, v)
 			if err != nil && testCase.expectedErr != nil {
 				// Validate if the type string of the errors are an exact match.
@@ -1233,10 +1195,7 @@ func TestXLStorageReadFile(t *testing.T) {
 				t.Errorf("Case: %d %#v, expected: %s, got :%s", i+1, testCase, testCase.expectedErr, err)
 			}
 			// Expected error retured, proceed further to validate the returned results.
-			if err != nil && testCase.expectedErr == nil {
-				t.Errorf("Case: %d %#v, expected: %s, got :%s", i+1, testCase, testCase.expectedErr, err)
-			}
-			if err == nil {
+			if err == nil && err == testCase.expectedErr {
 				if !bytes.Equal(testCase.expectedBuf, buf) {
 					t.Errorf("Case: %d %#v, expected: \"%s\", got: \"%s\"", i+1, testCase, string(testCase.expectedBuf), string(buf[:testCase.bufSize]))
 				}
@@ -1246,6 +1205,9 @@ func TestXLStorageReadFile(t *testing.T) {
 			}
 		}
 	}
+
+	// Reset the flag.
+	globalStorageClass.DMA = storageclass.DMAWrite
 
 	// TestXLStorage for permission denied.
 	if runtime.GOOS != globalWindowsOSName {
@@ -1258,7 +1220,7 @@ func TestXLStorageReadFile(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = os.Chmod(permDeniedDir, 0o755); err != nil {
+		if err = os.Chmod(permDeniedDir, 0755); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -1268,7 +1230,7 @@ func TestXLStorageReadFile(t *testing.T) {
 		}
 
 		// Common read buffer.
-		buf := make([]byte, 10)
+		var buf = make([]byte, 10)
 		if _, err = xlStoragePermStorage.ReadFile(context.Background(), "mybucket", "myobject", 0, buf, v); err != errFileAccessDenied {
 			t.Errorf("expected: %s, got: %s", errFileAccessDenied, err)
 		}
@@ -1361,7 +1323,7 @@ func TestXLStorageFormatFileChange(t *testing.T) {
 	}
 
 	// Change the format.json such that "this" is changed to "randomid".
-	if err = ioutil.WriteFile(pathJoin(xlStorage.String(), minioMetaBucket, formatConfigFile), []byte(`{"version":"1","format":"xl","id":"592a41c2-b7cc-4130-b883-c4b5cb15965b","xl":{"version":"3","this":"randomid","sets":[["e07285a6-8c73-4962-89c6-047fb939f803","33b8d431-482d-4376-b63c-626d229f0a29","cff6513a-4439-4dc1-bcaa-56c9e880c352","randomid","9c9f21d5-1f15-4737-bce6-835faa0d9626","0a59b346-1424-4fc2-9fa2-a2e80541d0c1","7924a3dc-b69a-4971-9a2e-014966d6aebb","4d2b8dd9-4e48-444b-bdca-c89194b26042"]],"distributionAlgo":"CRCMOD"}}`), 0o644); err != nil {
+	if err = ioutil.WriteFile(pathJoin(xlStorage.String(), minioMetaBucket, formatConfigFile), []byte(`{"version":"1","format":"xl","id":"592a41c2-b7cc-4130-b883-c4b5cb15965b","xl":{"version":"3","this":"randomid","sets":[["e07285a6-8c73-4962-89c6-047fb939f803","33b8d431-482d-4376-b63c-626d229f0a29","cff6513a-4439-4dc1-bcaa-56c9e880c352","randomid","9c9f21d5-1f15-4737-bce6-835faa0d9626","0a59b346-1424-4fc2-9fa2-a2e80541d0c1","7924a3dc-b69a-4971-9a2e-014966d6aebb","4d2b8dd9-4e48-444b-bdca-c89194b26042"]],"distributionAlgo":"CRCMOD"}}`), 0644); err != nil {
 		t.Fatalf("ioutil.WriteFile failed with %s", err)
 	}
 
@@ -1386,7 +1348,7 @@ func TestXLStorageAppendFile(t *testing.T) {
 	}
 
 	// Create directory to make errIsNotRegular
-	if err = os.Mkdir(slashpath.Join(path, "success-vol", "object-as-dir"), 0o777); err != nil {
+	if err = os.Mkdir(slashpath.Join(path, "success-vol", "object-as-dir"), 0777); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
@@ -1428,7 +1390,7 @@ func TestXLStorageAppendFile(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = os.Chmod(permDeniedDir, 0o755); err != nil {
+		if err = os.Chmod(permDeniedDir, 0755); err != nil {
 			t.Fatalf("Unable to change permission to temporary directory %v. %v", permDeniedDir, err)
 		}
 
@@ -1437,8 +1399,8 @@ func TestXLStorageAppendFile(t *testing.T) {
 			t.Fatalf("Unable to initialize xlStorage, %s", err)
 		}
 
-		if err = xlStoragePermStorage.AppendFile(context.Background(), "mybucket", "myobject", []byte("hello, world")); err != errVolumeAccessDenied {
-			t.Fatalf("expected: errVolumeAccessDenied error, got: %s", err)
+		if err = xlStoragePermStorage.AppendFile(context.Background(), "mybucket", "myobject", []byte("hello, world")); err != errFileAccessDenied {
+			t.Fatalf("expected: Permission error, got: %s", err)
 		}
 	}
 
@@ -1668,100 +1630,8 @@ func TestXLStorageRenameFile(t *testing.T) {
 	}
 }
 
-// TestXLStorageDeleteVersion will test if version deletes and bulk deletes work as expected.
-func TestXLStorageDeleteVersion(t *testing.T) {
-	// create xlStorage test setup
-	xl, path, err := newXLStorageTestSetup()
-	if err != nil {
-		t.Fatalf("Unable to create xlStorage test setup, %s", err)
-	}
-	defer os.RemoveAll(path)
-	ctx := context.Background()
-
-	volume := "myvol-vol"
-	object := "my-object"
-	if err := xl.MakeVol(ctx, volume); err != nil {
-		t.Fatalf("Unable to create volume, %s", err)
-	}
-	var versions [50]string
-	for i := range versions {
-		versions[i] = uuid.New().String()
-		fi := FileInfo{
-			Name: object, Volume: volume, VersionID: versions[i], ModTime: UTCNow(), DataDir: uuid.NewString(), Size: 10000,
-			Erasure: ErasureInfo{
-				Algorithm:    erasureAlgorithm,
-				DataBlocks:   4,
-				ParityBlocks: 4,
-				BlockSize:    blockSizeV2,
-				Index:        1,
-				Distribution: []int{0, 1, 2, 3, 4, 5, 6, 7},
-				Checksums:    nil,
-			},
-		}
-		if err := xl.WriteMetadata(ctx, volume, object, fi); err != nil {
-			t.Fatalf("Unable to create object, %s", err)
-		}
-	}
-	var deleted [len(versions)]bool
-	checkVerExist := func(t testing.TB) {
-		t.Helper()
-		for i := range versions {
-			shouldExist := !deleted[i]
-			fi, err := xl.ReadVersion(ctx, volume, object, versions[i], false)
-			if shouldExist {
-				if err != nil {
-					t.Fatalf("Version %s should exist, but got err %v", versions[i], err)
-				}
-				return
-			}
-			if err != errFileVersionNotFound {
-				t.Fatalf("Version %s should not exist, but returned: %#v", versions[i], fi)
-			}
-		}
-	}
-
-	// Delete version 0...
-	checkVerExist(t)
-	err = xl.DeleteVersion(ctx, volume, object, FileInfo{Name: object, Volume: volume, VersionID: versions[0]}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deleted[0] = true
-	checkVerExist(t)
-
-	// Delete 10 in bulk, including a non-existing.
-	fis := []FileInfoVersions{{Name: object, Volume: volume}}
-	for i := range versions[:10] {
-		fis[0].Versions = append(fis[0].Versions, FileInfo{Name: object, Volume: volume, VersionID: versions[i]})
-		deleted[i] = true
-	}
-	errs := xl.DeleteVersions(ctx, volume, fis)
-	if errs[0] != nil {
-		t.Fatalf("expected nil error, got %v", errs[0])
-	}
-	checkVerExist(t)
-
-	// Delete them all... (some again)
-	fis[0].Versions = nil
-	for i := range versions[:] {
-		fis[0].Versions = append(fis[0].Versions, FileInfo{Name: object, Volume: volume, VersionID: versions[i]})
-		deleted[i] = true
-	}
-	errs = xl.DeleteVersions(ctx, volume, fis)
-	if errs[0] != nil {
-		t.Fatalf("expected nil error, got %v", errs[0])
-	}
-	checkVerExist(t)
-
-	// Meta should be deleted now...
-	fi, err := xl.ReadVersion(ctx, volume, object, "", false)
-	if err != errFileNotFound {
-		t.Fatalf("Object %s should not exist, but returned: %#v", object, fi)
-	}
-}
-
-// TestXLStorage xlStorage.StatInfoFile()
-func TestXLStorageStatInfoFile(t *testing.T) {
+// TestXLStorage xlStorage.CheckFile()
+func TestXLStorageCheckFile(t *testing.T) {
 	// create xlStorage test setup
 	xlStorage, path, err := newXLStorageTestSetup()
 	if err != nil {
@@ -1831,20 +1701,19 @@ func TestXLStorageStatInfoFile(t *testing.T) {
 		{
 			srcVol:      "non-existent-vol",
 			srcPath:     "success-file",
-			expectedErr: errVolumeNotFound,
+			expectedErr: errPathNotFound,
 		},
 		// TestXLStorage case - 7.
 		// TestXLStorage case with file with directory.
 		{
 			srcVol:      "success-vol",
 			srcPath:     "path/to",
-			expectedErr: nil,
+			expectedErr: errFileNotFound,
 		},
 	}
 
 	for i, testCase := range testCases {
-		_, err := xlStorage.StatInfoFile(context.Background(), testCase.srcVol, testCase.srcPath+"/"+xlStorageFormatFile, false)
-		if err != testCase.expectedErr {
+		if err := xlStorage.CheckFile(context.Background(), testCase.srcVol, testCase.srcPath); err != testCase.expectedErr {
 			t.Errorf("TestXLStorage case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
 	}
@@ -1859,7 +1728,7 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	// 4) Streaming bitrot check on corrupted file
 
 	// create xlStorage test setup
-	storage, path, err := newXLStorageTestSetup()
+	xlStorage, path, err := newXLStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -1867,7 +1736,7 @@ func TestXLStorageVerifyFile(t *testing.T) {
 
 	volName := "testvol"
 	fileName := "testfile"
-	if err := storage.MakeVol(context.Background(), volName); err != nil {
+	if err := xlStorage.MakeVol(context.Background(), volName); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1881,29 +1750,29 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	h := algo.New()
 	h.Write(data)
 	hashBytes := h.Sum(nil)
-	if err := storage.WriteAll(context.Background(), volName, fileName, data); err != nil {
+	if err := xlStorage.WriteAll(context.Background(), volName, fileName, data); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.storage.bitrotVerify(context.Background(), pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err != nil {
+	if err := xlStorage.storage.bitrotVerify(pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	// 2) Whole-file bitrot check on corrupted file
-	if err := storage.AppendFile(context.Background(), volName, fileName, []byte("a")); err != nil {
+	if err := xlStorage.AppendFile(context.Background(), volName, fileName, []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check if VerifyFile reports the incorrect file length (the correct length is `size+1`)
-	if err := storage.storage.bitrotVerify(context.Background(), pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err == nil {
+	if err := xlStorage.storage.bitrotVerify(pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err == nil {
 		t.Fatal("expected to fail bitrot check")
 	}
 
 	// Check if bitrot fails
-	if err := storage.storage.bitrotVerify(context.Background(), pathJoin(path, volName, fileName), size+1, algo, hashBytes, 0); err == nil {
+	if err := xlStorage.storage.bitrotVerify(pathJoin(path, volName, fileName), size+1, algo, hashBytes, 0); err == nil {
 		t.Fatal("expected to fail bitrot check")
 	}
 
-	if err := storage.Delete(context.Background(), volName, fileName, false); err != nil {
+	if err := xlStorage.Delete(context.Background(), volName, fileName, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1911,7 +1780,7 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	algo = HighwayHash256S
 	shardSize := int64(1024 * 1024)
 	shard := make([]byte, shardSize)
-	w := newStreamingBitrotWriter(storage, volName, fileName, size, algo, shardSize)
+	w := newStreamingBitrotWriter(xlStorage, volName, fileName, size, algo, shardSize)
 	reader := bytes.NewReader(data)
 	for {
 		// Using io.Copy instead of this loop will not work for us as io.Copy
@@ -1927,14 +1796,14 @@ func TestXLStorageVerifyFile(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	w.(io.Closer).Close()
-	if err := storage.storage.bitrotVerify(context.Background(), pathJoin(path, volName, fileName), size, algo, nil, shardSize); err != nil {
+	w.Close()
+	if err := xlStorage.storage.bitrotVerify(pathJoin(path, volName, fileName), size, algo, nil, shardSize); err != nil {
 		t.Fatal(err)
 	}
 
 	// 4) Streaming bitrot check on corrupted file
-	filePath := pathJoin(storage.String(), volName, fileName)
-	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_SYNC, 0o644)
+	filePath := pathJoin(xlStorage.String(), volName, fileName)
+	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_SYNC, 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1943,30 +1812,10 @@ func TestXLStorageVerifyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if err := storage.storage.bitrotVerify(context.Background(), pathJoin(path, volName, fileName), size, algo, nil, shardSize); err == nil {
+	if err := xlStorage.storage.bitrotVerify(pathJoin(path, volName, fileName), size, algo, nil, shardSize); err == nil {
 		t.Fatal("expected to fail bitrot check")
 	}
-	if err := storage.storage.bitrotVerify(context.Background(), pathJoin(path, volName, fileName), size+1, algo, nil, shardSize); err == nil {
+	if err := xlStorage.storage.bitrotVerify(pathJoin(path, volName, fileName), size+1, algo, nil, shardSize); err == nil {
 		t.Fatal("expected to fail bitrot check")
-	}
-}
-
-// TestXLStorageReadMetadata tests readMetadata
-func TestXLStorageReadMetadata(t *testing.T) {
-	volume, object := "test-vol", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	tmpDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	disk, err := newLocalXLStorage(tmpDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	disk.MakeVol(context.Background(), volume)
-	if _, err := disk.readMetadata(context.Background(), pathJoin(tmpDir, volume, object)); err != errFileNameTooLong {
-		t.Fatalf("Unexpected error from readMetadata - expect %v: got %v", errFileNameTooLong, err)
 	}
 }

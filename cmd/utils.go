@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2015-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -21,17 +20,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -39,39 +37,20 @@ import (
 	"runtime/trace"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/coreos/go-oidc"
-	"github.com/dustin/go-humanize"
-	"github.com/felixge/fgprof"
+	humanize "github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go"
-	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
-	"github.com/minio/minio/internal/config"
-	"github.com/minio/minio/internal/config/api"
-	xtls "github.com/minio/minio/internal/config/identity/tls"
-	"github.com/minio/minio/internal/fips"
-	"github.com/minio/minio/internal/handlers"
-	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/logger/message/audit"
-	"github.com/minio/minio/internal/rest"
-	"github.com/minio/pkg/certs"
-	"github.com/minio/pkg/env"
-	"golang.org/x/oauth2"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/handlers"
+	"github.com/minio/minio/pkg/madmin"
+	"golang.org/x/net/http2"
 )
 
 const (
 	slashSeparator = "/"
 )
-
-// BucketAccessPolicy - Collection of canned bucket policy at a given prefix.
-type BucketAccessPolicy struct {
-	Bucket string                     `json:"bucket"`
-	Prefix string                     `json:"prefix"`
-	Policy miniogopolicy.BucketPolicy `json:"policy"`
-}
 
 // IsErrIgnored returns whether given error is ignored or not.
 func IsErrIgnored(err error, ignoredErrs ...error) bool {
@@ -111,6 +90,10 @@ func path2BucketObjectWithBasePath(basePath, path string) (bucket, prefix string
 
 func path2BucketObject(s string) (bucket, prefix string) {
 	return path2BucketObjectWithBasePath("", s)
+}
+
+func getReadQuorum(drive int) int {
+	return drive - getDefaultParityBlocks(drive)
 }
 
 func getWriteQuorum(drive int) int {
@@ -158,13 +141,25 @@ func xmlDecoder(body io.Reader, v interface{}, size int64) error {
 	return d.Decode(v)
 }
 
+// checkValidMD5 - verify if valid md5, returns md5 in bytes.
+func checkValidMD5(h http.Header) ([]byte, error) {
+	md5B64, ok := h[xhttp.ContentMD5]
+	if ok {
+		if md5B64[0] == "" {
+			return nil, fmt.Errorf("Content-Md5 header set to empty value")
+		}
+		return base64.StdEncoding.Strict().DecodeString(md5B64[0])
+	}
+	return []byte{}, nil
+}
+
 // hasContentMD5 returns true if Content-MD5 header is set.
 func hasContentMD5(h http.Header) bool {
 	_, ok := h[xhttp.ContentMD5]
 	return ok
 }
 
-// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
+/// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
 const (
 	// Maximum object size per PUT request is 5TB.
 	// This is a divergence from S3 limit on purpose to support
@@ -223,27 +218,25 @@ func contains(slice interface{}, elem interface{}) bool {
 // disk since the name of this latter is randomly generated.
 type profilerWrapper struct {
 	// Profile recorded at start of benchmark.
-	records map[string][]byte
-	stopFn  func() ([]byte, error)
-	ext     string
+	base   []byte
+	stopFn func() ([]byte, error)
+	ext    string
 }
 
-// record will record the profile and store it as the base.
-func (p *profilerWrapper) record(profileType string, debug int, recordName string) {
+// recordBase will record the profile and store it as the base.
+func (p *profilerWrapper) recordBase(name string, debug int) {
 	var buf bytes.Buffer
-	if p.records == nil {
-		p.records = make(map[string][]byte)
-	}
-	err := pprof.Lookup(profileType).WriteTo(&buf, debug)
+	p.base = nil
+	err := pprof.Lookup(name).WriteTo(&buf, debug)
 	if err != nil {
 		return
 	}
-	p.records[recordName] = buf.Bytes()
+	p.base = buf.Bytes()
 }
 
-// Records returns the recorded profiling if any.
-func (p profilerWrapper) Records() map[string][]byte {
-	return p.records
+// Base returns the recorded base if any.
+func (p profilerWrapper) Base() []byte {
+	return p.base
 }
 
 // Stop the currently running benchmark.
@@ -275,10 +268,9 @@ func getProfileData() (map[string][]byte, error) {
 		if err == nil {
 			dst[typ+"."+prof.Extension()] = buf
 		}
-		for name, buf := range prof.Records() {
-			if len(buf) > 0 {
-				dst[typ+"-"+name+"."+prof.Extension()] = buf
-			}
+		buf = prof.Base()
+		if len(buf) > 0 {
+			dst[typ+"-before"+"."+prof.Extension()] = buf
 		}
 	}
 	return dst, nil
@@ -320,44 +312,9 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			defer os.RemoveAll(dirPath)
 			return ioutil.ReadFile(fn)
 		}
-		// TODO(klauspost): Replace with madmin.ProfilerCPUIO on next update.
-	case "cpuio":
-		// at 10k or more goroutines fgprof is likely to become
-		// unable to maintain its sampling rate and to significantly
-		// degrade the performance of your application
-		// https://github.com/felixge/fgprof#fgprof
-		if n := runtime.NumGoroutine(); n > 10000 && !globalIsCICD {
-			return nil, fmt.Errorf("unable to perform CPU IO profile with %d goroutines", n)
-		}
-		dirPath, err := ioutil.TempDir("", "profile")
-		if err != nil {
-			return nil, err
-		}
-		fn := filepath.Join(dirPath, "cpuio.out")
-		f, err := os.Create(fn)
-		if err != nil {
-			return nil, err
-		}
-		stop := fgprof.Start(f, fgprof.FormatPprof)
-		err = pprof.StartCPUProfile(f)
-		if err != nil {
-			return nil, err
-		}
-		prof.stopFn = func() ([]byte, error) {
-			err := stop()
-			if err != nil {
-				return nil, err
-			}
-			err = f.Close()
-			if err != nil {
-				return nil, err
-			}
-			defer os.RemoveAll(dirPath)
-			return ioutil.ReadFile(fn)
-		}
 	case madmin.ProfilerMEM:
 		runtime.GC()
-		prof.record("heap", 0, "before")
+		prof.recordBase("heap", 0)
 		prof.stopFn = func() ([]byte, error) {
 			runtime.GC()
 			var buf bytes.Buffer
@@ -365,7 +322,8 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerBlock:
-		runtime.SetBlockProfileRate(100)
+		prof.recordBase("block", 0)
+		runtime.SetBlockProfileRate(1)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
 			err := pprof.Lookup("block").WriteTo(&buf, 0)
@@ -373,7 +331,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerMutex:
-		prof.record("mutex", 0, "before")
+		prof.recordBase("mutex", 0)
 		runtime.SetMutexProfileFraction(1)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
@@ -382,7 +340,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerThreads:
-		prof.record("threadcreate", 0, "before")
+		prof.recordBase("threadcreate", 0)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
 			err := pprof.Lookup("threadcreate").WriteTo(&buf, 0)
@@ -390,8 +348,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 		}
 	case madmin.ProfilerGoroutines:
 		prof.ext = "txt"
-		prof.record("goroutine", 1, "before")
-		prof.record("goroutine", 2, "before,debug=2")
+		prof.recordBase("goroutine", 1)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
 			err := pprof.Lookup("goroutine").WriteTo(&buf, 1)
@@ -430,8 +387,8 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 
 // minioProfiler - minio profiler interface.
 type minioProfiler interface {
-	// Return recorded profiles, each profile associated with a distinct generic name.
-	Records() map[string][]byte
+	// Return base profile. 'nil' if none.
+	Base() []byte
 	// Stop the profiler
 	Stop() ([]byte, error)
 	// Return extension of profile
@@ -439,10 +396,8 @@ type minioProfiler interface {
 }
 
 // Global profiler to be used by service go-routine.
-var (
-	globalProfiler   map[string]minioProfiler
-	globalProfilerMu sync.Mutex
-)
+var globalProfiler map[string]minioProfiler
+var globalProfilerMu sync.Mutex
 
 // dump the request into a string in JSON format.
 func dumpRequest(r *http.Request) string {
@@ -450,7 +405,7 @@ func dumpRequest(r *http.Request) string {
 	header.Set("Host", r.Host)
 	// Replace all '%' to '%%' so that printer format parser
 	// to ignore URL encoded values.
-	rawURI := strings.ReplaceAll(r.RequestURI, "%", "%%")
+	rawURI := strings.Replace(r.RequestURI, "%", "%%", -1)
 	req := struct {
 		Method     string      `json:"method"`
 		RequestURI string      `json:"reqURI"`
@@ -508,10 +463,8 @@ func newInternodeHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration)
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
 		MaxIdleConnsPerHost:   1024,
-		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
-		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Minute, // Set conservative timeouts for MinIO internode.
+		ResponseHeaderTimeout: 3 * time.Minute, // Set conservative timeouts for MinIO internode.
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 15 * time.Second,
 		TLSClientConfig:       tlsConfig,
@@ -555,9 +508,6 @@ func newCustomHTTPProxyTransport(tlsConfig *tls.Config, dialTimeout time.Duratio
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
 		MaxIdleConnsPerHost:   1024,
-		MaxConnsPerHost:       1024,
-		WriteBufferSize:       16 << 10, // 16KiB moving up from 4KiB default
-		ReadBufferSize:        16 << 10, // 16KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Minute, // Set larger timeouts for proxied requests.
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -574,6 +524,45 @@ func newCustomHTTPProxyTransport(tlsConfig *tls.Config, dialTimeout time.Duratio
 	}
 }
 
+func newCustomHTTPTransportWithHTTP2(tlsConfig *tls.Config, dialTimeout time.Duration) func() *http.Transport {
+	// For more details about various values used here refer
+	// https://golang.org/pkg/net/http/#Transport documentation
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
+		MaxIdleConnsPerHost:   1024,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: 1 * time.Minute,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 10 * time.Second,
+		TLSClientConfig:       tlsConfig,
+		// Go net/http automatically unzip if content-type is
+		// gzip disable this feature, as we are always interested
+		// in raw stream.
+		DisableCompression: true,
+	}
+
+	if tlsConfig != nil {
+		trhttp2, _ := http2.ConfigureTransports(tr)
+		if trhttp2 != nil {
+			// ReadIdleTimeout is the timeout after which a health check using ping
+			// frame will be carried out if no frame is received on the
+			// connection. 5 minutes is sufficient time for any idle connection.
+			trhttp2.ReadIdleTimeout = 5 * time.Minute
+			// PingTimeout is the timeout after which the connection will be closed
+			// if a response to Ping is not received.
+			trhttp2.PingTimeout = dialTimeout
+			// DisableCompression, if true, prevents the Transport from
+			// requesting compression with an "Accept-Encoding: gzip"
+			trhttp2.DisableCompression = true
+		}
+	}
+
+	return func() *http.Transport {
+		return tr
+	}
+}
+
 func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) func() *http.Transport {
 	// For more details about various values used here refer
 	// https://golang.org/pkg/net/http/#Transport documentation
@@ -581,8 +570,6 @@ func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) fu
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
 		MaxIdleConnsPerHost:   1024,
-		WriteBufferSize:       16 << 10, // 16KiB moving up from 4KiB default
-		ReadBufferSize:        16 << 10, // 16KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
 		ResponseHeaderTimeout: 3 * time.Minute, // Set conservative timeouts for MinIO internode.
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -620,27 +607,6 @@ func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) fu
 	}
 }
 
-// NewGatewayHTTPTransportWithClientCerts returns a new http configuration
-// used while communicating with the cloud backends.
-func NewGatewayHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transport {
-	transport := newGatewayHTTPTransport(1 * time.Minute)
-	if clientCert != "" && clientKey != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		c, err := certs.NewManager(ctx, clientCert, clientKey, tls.LoadX509KeyPair)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to load client key and cert, please check your endpoint configuration: %s",
-				err.Error()))
-		}
-		if c != nil {
-			c.UpdateReloadDuration(10 * time.Second)
-			c.ReloadOnSignal(syscall.SIGHUP) // allow reloads upon SIGHUP
-			transport.TLSClientConfig.GetClientCertificate = c.GetClientCertificate
-		}
-	}
-	return transport
-}
-
 // NewGatewayHTTPTransport returns a new http configuration
 // used while communicating with the cloud backends.
 func NewGatewayHTTPTransport() *http.Transport {
@@ -649,41 +615,11 @@ func NewGatewayHTTPTransport() *http.Transport {
 
 func newGatewayHTTPTransport(timeout time.Duration) *http.Transport {
 	tr := newCustomHTTPTransport(&tls.Config{
-		RootCAs:            globalRootCAs,
-		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
+		RootCAs: globalRootCAs,
 	}, defaultDialTimeout)()
 
 	// Customize response header timeout for gateway transport.
 	tr.ResponseHeaderTimeout = timeout
-	return tr
-}
-
-// NewRemoteTargetHTTPTransport returns a new http configuration
-// used while communicating with the remote replication targets.
-func NewRemoteTargetHTTPTransport() *http.Transport {
-	// For more details about various values used here refer
-	// https://golang.org/pkg/net/http/#Transport documentation
-	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConnsPerHost:   1024,
-		WriteBufferSize:       16 << 10, // 16KiB moving up from 4KiB default
-		ReadBufferSize:        16 << 10, // 16KiB moving up from 4KiB default
-		IdleConnTimeout:       15 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 5 * time.Second,
-		TLSClientConfig: &tls.Config{
-			RootCAs:            globalRootCAs,
-			ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
-		},
-		// Go net/http automatically unzip if content-type is
-		// gzip disable this feature, as we are always interested
-		// in raw stream.
-		DisableCompression: true,
-	}
 	return tr
 }
 
@@ -699,8 +635,7 @@ func jsonLoad(r io.ReadSeeker, data interface{}) error {
 func jsonSave(f interface {
 	io.WriteSeeker
 	Truncate(int64) error
-}, data interface{},
-) error {
+}, data interface{}) error {
 	b, err := json.Marshal(data)
 	if err != nil {
 		return err
@@ -738,80 +673,18 @@ func ceilFrac(numerator, denominator int64) (ceil int64) {
 	return
 }
 
-// pathClean is like path.Clean but does not return "." for
-// empty inputs, instead returns "empty" as is.
-func pathClean(p string) string {
-	cp := path.Clean(p)
-	if cp == "." {
-		return ""
-	}
-	return cp
-}
-
-func trimLeadingSlash(ep string) string {
-	if len(ep) > 0 && ep[0] == '/' {
-		// Path ends with '/' preserve it
-		if ep[len(ep)-1] == '/' && len(ep) > 1 {
-			ep = path.Clean(ep)
-			ep += slashSeparator
-		} else {
-			ep = path.Clean(ep)
-		}
-		ep = ep[1:]
-	}
-	return ep
-}
-
-// unescapeGeneric is similar to url.PathUnescape or url.QueryUnescape
-// depending on input, additionally also handles situations such as
-// `//` are normalized as `/`, also removes any `/` prefix before
-// returning.
-func unescapeGeneric(p string, escapeFn func(string) (string, error)) (string, error) {
-	ep, err := escapeFn(p)
-	if err != nil {
-		return "", err
-	}
-	return trimLeadingSlash(ep), nil
-}
-
-// unescapePath is similar to unescapeGeneric but for specifically
-// path unescaping.
-func unescapePath(p string) (string, error) {
-	return unescapeGeneric(p, url.PathUnescape)
-}
-
-// similar to unescapeGeneric but never returns any error if the unescaping
-// fails, returns the input as is in such occasion, not meant to be
-// used where strict validation is expected.
-func likelyUnescapeGeneric(p string, escapeFn func(string) (string, error)) string {
-	ep, err := unescapeGeneric(p, escapeFn)
-	if err != nil {
-		return p
-	}
-	return ep
-}
-
-func updateReqContext(ctx context.Context, objects ...ObjectV) context.Context {
-	req := logger.GetReqInfo(ctx)
-	if req != nil {
-		req.Objects = make([]logger.ObjectVersion, 0, len(objects))
-		for _, ov := range objects {
-			req.Objects = append(req.Objects, logger.ObjectVersion{
-				ObjectName: ov.ObjectName,
-				VersionID:  ov.VersionID,
-			})
-		}
-		return logger.SetReqInfo(ctx, req)
-	}
-	return ctx
-}
-
 // Returns context with ReqInfo details set in the context.
 func newContext(r *http.Request, w http.ResponseWriter, api string) context.Context {
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
-	object := likelyUnescapeGeneric(vars["object"], url.PathUnescape)
-	prefix := likelyUnescapeGeneric(vars["prefix"], url.QueryUnescape)
+	object, err := url.PathUnescape(vars["object"])
+	if err != nil {
+		object = vars["object"]
+	}
+	prefix, err := url.QueryUnescape(vars["prefix"])
+	if err != nil {
+		prefix = vars["prefix"]
+	}
 	if prefix != "" {
 		object = prefix
 	}
@@ -824,7 +697,6 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 		API:          api,
 		BucketName:   bucket,
 		ObjectName:   object,
-		VersionID:    strings.TrimSpace(r.Form.Get(xhttp.VersionID)),
 	}
 	return logger.SetReqInfo(r.Context(), reqInfo)
 }
@@ -991,216 +863,4 @@ func decodeDirObject(object string) string {
 		return strings.TrimSuffix(object, globalDirSuffix) + slashSeparator
 	}
 	return object
-}
-
-// This is used by metrics to show the number of failed RPC calls
-// between internodes
-func loadAndResetRPCNetworkErrsCounter() uint64 {
-	defer rest.ResetNetworkErrsCounter()
-	return rest.GetNetworkErrsCounter()
-}
-
-// Helper method to return total number of nodes in cluster
-func totalNodeCount() uint64 {
-	peers, _ := globalEndpoints.peers()
-	totalNodesCount := uint64(len(peers))
-	if totalNodesCount == 0 {
-		totalNodesCount = 1 // For standalone erasure coding
-	}
-	return totalNodesCount
-}
-
-// AuditLogOptions takes options for audit logging subsystem activity
-type AuditLogOptions struct {
-	Trigger   string
-	APIName   string
-	Status    string
-	VersionID string
-}
-
-// sends audit logs for internal subsystem activity
-func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogOptions) {
-	entry := audit.NewEntry(globalDeploymentID)
-	entry.Trigger = opts.Trigger
-	entry.API.Name = opts.APIName
-	entry.API.Bucket = bucket
-	entry.API.Object = object
-	if opts.VersionID != "" {
-		entry.ReqQuery = make(map[string]string)
-		entry.ReqQuery[xhttp.VersionID] = opts.VersionID
-	}
-	entry.API.Status = opts.Status
-	ctx = logger.SetAuditEntry(ctx, &entry)
-	logger.AuditLog(ctx, nil, nil, nil)
-}
-
-func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
-	if getCert == nil {
-		return nil
-	}
-
-	tlsConfig := &tls.Config{
-		PreferServerCipherSuites: true,
-		MinVersion:               tls.VersionTLS12,
-		NextProtos:               []string{"http/1.1", "h2"},
-		GetCertificate:           getCert,
-		ClientSessionCache:       tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
-	}
-
-	tlsClientIdentity := env.Get(xtls.EnvIdentityTLSEnabled, "") == config.EnableOn
-	if tlsClientIdentity {
-		tlsConfig.ClientAuth = tls.RequestClientCert
-	}
-
-	secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn
-	if secureCiphers || fips.Enabled {
-		// Hardened ciphers
-		tlsConfig.CipherSuites = fips.CipherSuitesTLS()
-		tlsConfig.CurvePreferences = fips.EllipticCurvesTLS()
-	} else {
-		// Default ciphers while excluding those with security issues
-		for _, cipher := range tls.CipherSuites() {
-			tlsConfig.CipherSuites = append(tlsConfig.CipherSuites, cipher.ID)
-		}
-	}
-	return tlsConfig
-}
-
-/////////// Types and functions for OpenID IAM testing
-
-// OpenIDClientAppParams - contains openID client application params, used in
-// testing.
-type OpenIDClientAppParams struct {
-	ClientID, ClientSecret, ProviderURL, RedirectURL string
-}
-
-// MockOpenIDTestUserInteraction - tries to login to dex using provided credentials.
-// It performs the user's browser interaction to login and retrieves the auth
-// code from dex and exchanges it for a JWT.
-func MockOpenIDTestUserInteraction(ctx context.Context, pro OpenIDClientAppParams, username, password string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	provider, err := oidc.NewProvider(ctx, pro.ProviderURL)
-	if err != nil {
-		return "", fmt.Errorf("unable to create provider: %v", err)
-	}
-
-	// Configure an OpenID Connect aware OAuth2 client.
-	oauth2Config := oauth2.Config{
-		ClientID:     pro.ClientID,
-		ClientSecret: pro.ClientSecret,
-		RedirectURL:  pro.RedirectURL,
-
-		// Discovery returns the OAuth2 endpoints.
-		Endpoint: provider.Endpoint(),
-
-		// "openid" is a required scope for OpenID Connect flows.
-		Scopes: []string{oidc.ScopeOpenID, "groups"},
-	}
-
-	state := fmt.Sprintf("x%dx", time.Now().Unix())
-	authCodeURL := oauth2Config.AuthCodeURL(state)
-	// fmt.Printf("authcodeurl: %s\n", authCodeURL)
-
-	var lastReq *http.Request
-	checkRedirect := func(req *http.Request, via []*http.Request) error {
-		// fmt.Printf("CheckRedirect:\n")
-		// fmt.Printf("Upcoming: %s %s\n", req.Method, req.URL.String())
-		// for i, c := range via {
-		// 	fmt.Printf("Sofar %d: %s %s\n", i, c.Method, c.URL.String())
-		// }
-		// Save the last request in a redirect chain.
-		lastReq = req
-		// We do not follow redirect back to client application.
-		if req.URL.Path == "/oauth_callback" {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	}
-
-	dexClient := http.Client{
-		CheckRedirect: checkRedirect,
-	}
-
-	u, err := url.Parse(authCodeURL)
-	if err != nil {
-		return "", fmt.Errorf("url parse err: %v", err)
-	}
-
-	// Start the user auth flow. This page would present the login with
-	// email or LDAP option.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return "", fmt.Errorf("new request err: %v", err)
-	}
-	_, err = dexClient.Do(req)
-	// fmt.Printf("Do: %#v %#v\n", resp, err)
-	if err != nil {
-		return "", fmt.Errorf("auth url request err: %v", err)
-	}
-
-	// Modify u to choose the ldap option
-	u.Path += "/ldap"
-	// fmt.Println(u)
-
-	// Pick the LDAP login option. This would return a form page after
-	// following some redirects. `lastReq` would be the URL of the form
-	// page, where we need to POST (submit) the form.
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return "", fmt.Errorf("new request err (/ldap): %v", err)
-	}
-	_, err = dexClient.Do(req)
-	// fmt.Printf("Fetch LDAP login page: %#v %#v\n", resp, err)
-	if err != nil {
-		return "", fmt.Errorf("request err: %v", err)
-	}
-	// {
-	// 	bodyBuf, err := ioutil.ReadAll(resp.Body)
-	// 	if err != nil {
-	// 		return "", fmt.Errorf("Error reading body: %v", err)
-	// 	}
-	// 	fmt.Printf("bodyBuf (for LDAP login page): %s\n", string(bodyBuf))
-	// }
-
-	// Fill the login form with our test creds:
-	// fmt.Printf("login form url: %s\n", lastReq.URL.String())
-	formData := url.Values{}
-	formData.Set("login", username)
-	formData.Set("password", password)
-	req, err = http.NewRequestWithContext(ctx, http.MethodPost, lastReq.URL.String(), strings.NewReader(formData.Encode()))
-	if err != nil {
-		return "", fmt.Errorf("new request err (/login): %v", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	_, err = dexClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("post form err: %v", err)
-	}
-	// fmt.Printf("resp: %#v %#v\n", resp.StatusCode, resp.Header)
-	// bodyBuf, err := ioutil.ReadAll(resp.Body)
-	// if err != nil {
-	// 	return "", fmt.Errorf("Error reading body: %v", err)
-	// }
-	// fmt.Printf("resp body: %s\n", string(bodyBuf))
-	// fmt.Printf("lastReq: %#v\n", lastReq.URL.String())
-
-	// On form submission, the last redirect response contains the auth
-	// code, which we now have in `lastReq`. Exchange it for a JWT id_token.
-	q := lastReq.URL.Query()
-	// fmt.Printf("lastReq.URL: %#v q: %#v\n", lastReq.URL, q)
-	code := q.Get("code")
-	oauth2Token, err := oauth2Config.Exchange(ctx, code)
-	if err != nil {
-		return "", fmt.Errorf("unable to exchange code for id token: %v", err)
-	}
-
-	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
-	if !ok {
-		return "", fmt.Errorf("id_token not found!")
-	}
-
-	// fmt.Printf("TOKEN: %s\n", rawIDToken)
-	return rawIDToken, nil
 }

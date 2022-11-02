@@ -1,11 +1,11 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -192,41 +192,34 @@ func TestAzureCodesToObjectError(t *testing.T) {
 	}{
 		{
 			nil, "ContainerAlreadyExists", 0,
-			minio.BucketExists{Bucket: "bucket"},
-			"bucket", "",
+			minio.BucketExists{Bucket: "bucket"}, "bucket", "",
 		},
 		{
 			nil, "InvalidResourceName", 0,
-			minio.BucketNameInvalid{Bucket: "bucket."},
-			"bucket.", "",
+			minio.BucketNameInvalid{Bucket: "bucket."}, "bucket.", "",
 		},
 		{
 			nil, "RequestBodyTooLarge", 0,
-			minio.PartTooBig{},
-			"", "",
+			minio.PartTooBig{}, "", "",
 		},
 		{
 			nil, "InvalidMetadata", 0,
-			minio.UnsupportedMetadata{},
-			"", "",
+			minio.UnsupportedMetadata{}, "", "",
 		},
 		{
 			nil, "", http.StatusNotFound,
 			minio.ObjectNotFound{
 				Bucket: "bucket",
 				Object: "object",
-			},
-			"bucket", "object",
+			}, "bucket", "object",
 		},
 		{
 			nil, "", http.StatusNotFound,
-			minio.BucketNotFound{Bucket: "bucket"},
-			"bucket", "",
+			minio.BucketNotFound{Bucket: "bucket"}, "bucket", "",
 		},
 		{
 			nil, "", http.StatusBadRequest,
-			minio.BucketNameInvalid{Bucket: "bucket."},
-			"bucket.", "",
+			minio.BucketNameInvalid{Bucket: "bucket."}, "bucket.", "",
 		},
 		{
 			fmt.Errorf("unhandled azure error"), "", http.StatusForbidden,

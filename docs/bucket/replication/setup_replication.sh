@@ -1,8 +1,10 @@
 #!/bin/sh
 
-# Create buckets with versioning and object locking enabled.
-mc mb -l source/bucket
-mc mb -l dest/bucket
+# create buckets with versioning enabled
+mc mb source/bucket --l    # --l flag enables object locking.If not needed, uncomment the 'mc version enable' commands
+mc mb dest/bucket  --l 
+#mc version enable source/bucket
+#mc version enable dest/bucket
 
 #### Create a replication admin on source alias
 # create a replication admin user : repladmin
@@ -25,7 +27,6 @@ cat > repladmin-policy-source.json <<EOF
       "Effect": "Allow",
       "Action": [
        "s3:GetReplicationConfiguration",
-       "s3:PutReplicationConfiguration",
        "s3:ListBucket",
        "s3:ListBucketMultipartUploads",
        "s3:GetBucketLocation",
@@ -93,13 +94,12 @@ EOF
 mc admin policy add dest replpolicy ./replpolicy.json
 cat ./replpolicy.json
 
-# assign this replication policy to repluser
+#assign this replication policy to repluser
 mc admin policy set dest replpolicy user=repluser
 
 # define remote target for replication from source/bucket -> dest/bucket
-remote_arn=$(mc admin bucket remote add repladminAlias/bucket http://repluser:repluser123@localhost:9000/bucket --service replication --json | jq -r ".RemoteARN")
+mc admin bucket remote add repladminAlias/bucket http://repluser:repluser123@localhost:9000/bucket --service replication --region us-east-1
 
 echo "Now, use this ARN to add replication rules using 'mc replicate add' command"
 # use arn returned by above command to create a replication policy on the source/bucket with `mc replicate add`
-mc replicate add source/bucket --priority 1 --remote-bucket "${remote_arn}" \
-   --replicate existing-objects,delete,delete-marker,replica-metadata-sync
+#mc replicate add source/bucket --priority 1 --remote-bucket bucket --arn arn:minio:replication:us-east-1:21fb52f5857473e2dbdcf62dcac21240861caf0f8301c3d26aad4de7677869c7:bucket --replicate delete-marker,delete

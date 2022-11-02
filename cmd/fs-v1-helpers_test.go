@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -25,7 +24,7 @@ import (
 	"path"
 	"testing"
 
-	"github.com/minio/minio/internal/lock"
+	"github.com/minio/minio/pkg/lock"
 )
 
 func TestFSRenameFile(t *testing.T) {
@@ -75,7 +74,7 @@ func TestFSStats(t *testing.T) {
 		t.Fatalf("Unable to create volume, %s", err)
 	}
 
-	reader := bytes.NewReader([]byte("Hello, world"))
+	var reader = bytes.NewReader([]byte("Hello, world"))
 	if _, err = fsCreateFile(GlobalContext, pathJoin(path, "success-vol", "success-file"), reader, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
@@ -201,7 +200,7 @@ func TestFSCreateAndOpen(t *testing.T) {
 		t.Fatal("Unexpected error", err)
 	}
 
-	reader := bytes.NewReader([]byte("Hello, world"))
+	var reader = bytes.NewReader([]byte("Hello, world"))
 	if _, err = fsCreateFile(GlobalContext, pathJoin(path, "success-vol", "success-file"), reader, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
@@ -259,7 +258,7 @@ func TestFSDeletes(t *testing.T) {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
-	reader := bytes.NewReader([]byte("Hello, world"))
+	var reader = bytes.NewReader([]byte("Hello, world"))
 	if _, err = fsCreateFile(GlobalContext, pathJoin(path, "success-vol", "success-file"), reader, reader.Size()); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
@@ -271,7 +270,7 @@ func TestFSDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = ioutil.WriteFile(pathJoin(path, "success-vol", "not-empty", "file"), []byte("data"), 0o777)
+	err = ioutil.WriteFile(pathJoin(path, "success-vol", "not-empty", "file"), []byte("data"), 0777)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +367,7 @@ func BenchmarkFSDeleteFile(b *testing.B) {
 	// We need to create and delete the file sequentially inside the benchmark.
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		err = ioutil.WriteFile(filename, []byte("data"), 0o777)
+		err = ioutil.WriteFile(filename, []byte("data"), 0777)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -395,7 +394,7 @@ func TestFSRemoves(t *testing.T) {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
-	reader := bytes.NewReader([]byte("Hello, world"))
+	var reader = bytes.NewReader([]byte("Hello, world"))
 	if _, err = fsCreateFile(GlobalContext, pathJoin(path, "success-vol", "success-file"), reader, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
@@ -514,7 +513,7 @@ func TestFSRemoveMeta(t *testing.T) {
 
 	filePath := pathJoin(fsPath, "success-vol", "success-file")
 
-	reader := bytes.NewReader([]byte("Hello, world"))
+	var reader = bytes.NewReader([]byte("Hello, world"))
 	if _, err = fsCreateFile(GlobalContext, filePath, reader, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
@@ -556,7 +555,7 @@ func TestFSIsFile(t *testing.T) {
 
 	filePath := pathJoin(dirPath, "tmpfile")
 
-	if err = ioutil.WriteFile(filePath, nil, 0o777); err != nil {
+	if err = ioutil.WriteFile(filePath, nil, 0777); err != nil {
 		t.Fatalf("Unable to create file %s", filePath)
 	}
 

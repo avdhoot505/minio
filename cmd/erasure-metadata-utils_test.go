@@ -1,27 +1,23 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
-	"encoding/hex"
-	"fmt"
-	"math/rand"
 	"reflect"
 	"testing"
 )
@@ -54,10 +50,6 @@ func TestDiskCount(t *testing.T) {
 // Test for reduceErrs, reduceErr reduces collection
 // of errors into a single maximal error with in the list.
 func TestReduceErrs(t *testing.T) {
-	canceledErrs := make([]error, 0, 5)
-	for i := 0; i < 5; i++ {
-		canceledErrs = append(canceledErrs, fmt.Errorf("error %d: %w", i, context.Canceled))
-	}
 	// List all of all test cases to validate various cases of reduce errors.
 	testCases := []struct {
 		errs        []error
@@ -87,15 +79,9 @@ func TestReduceErrs(t *testing.T) {
 			errDiskNotFound,
 		}, []error{errDiskNotFound}, errVolumeNotFound},
 		{[]error{}, []error{}, errErasureReadQuorum},
-		{
-			[]error{
-				errFileNotFound, errFileNotFound, errFileNotFound,
-				errFileNotFound, errFileNotFound, nil, nil, nil, nil, nil,
-			},
-			nil, nil,
-		},
-		// Checks if wrapped context cancelation errors are grouped as one.
-		{canceledErrs, nil, context.Canceled},
+		{[]error{errFileNotFound, errFileNotFound, errFileNotFound,
+			errFileNotFound, errFileNotFound, nil, nil, nil, nil, nil},
+			nil, nil},
 	}
 	// Validates list of all the testcases for returning valid errors.
 	for i, testCase := range testCases {
@@ -212,23 +198,4 @@ func TestEvalDisks(t *testing.T) {
 	defer removeRoots(disks)
 	z := objLayer.(*erasureServerPools)
 	testShuffleDisks(t, z)
-}
-
-func Test_hashOrder(t *testing.T) {
-	for x := 1; x < 17; x++ {
-		t.Run(fmt.Sprintf("%d", x), func(t *testing.T) {
-			var first [17]int
-			rng := rand.New(rand.NewSource(0))
-			var tmp [16]byte
-			rng.Read(tmp[:])
-			prefix := hex.EncodeToString(tmp[:])
-			for i := 0; i < 10000; i++ {
-				rng.Read(tmp[:])
-
-				y := hashOrder(fmt.Sprintf("%s/%x", prefix, hex.EncodeToString(tmp[:3])), x)
-				first[y[0]]++
-			}
-			t.Log("first:", first[:x])
-		})
-	}
 }

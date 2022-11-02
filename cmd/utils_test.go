@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -29,7 +28,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 // Tests maximum object size.
@@ -239,8 +237,9 @@ func TestDumpRequest(t *testing.T) {
 		RequestURI string      `json:"reqURI"`
 		Header     http.Header `json:"header"`
 	}
+	jsonReq = strings.Replace(jsonReq, "%%", "%", -1)
 	res := jsonResult{}
-	if err = json.Unmarshal([]byte(strings.ReplaceAll(jsonReq, "%%", "%")), &res); err != nil {
+	if err = json.Unmarshal([]byte(jsonReq), &res); err != nil {
 		t.Fatal(err)
 	}
 
@@ -293,6 +292,7 @@ func TestToS3ETag(t *testing.T) {
 
 // Test contains
 func TestContains(t *testing.T) {
+
 	testErr := errors.New("test err")
 
 	testCases := []struct {
@@ -397,8 +397,9 @@ func TestCeilFrac(t *testing.T) {
 
 // Test if isErrIgnored works correctly.
 func TestIsErrIgnored(t *testing.T) {
-	errIgnored := fmt.Errorf("ignored error")
-	testCases := []struct {
+	var errIgnored = fmt.Errorf("ignored error")
+	ignoredErrs := append(baseIgnoredErrs, errIgnored)
+	var testCases = []struct {
 		err     error
 		ignored bool
 	}{
@@ -416,7 +417,7 @@ func TestIsErrIgnored(t *testing.T) {
 		},
 	}
 	for i, testCase := range testCases {
-		if ok := IsErrIgnored(testCase.err, append(baseIgnoredErrs, errIgnored)...); ok != testCase.ignored {
+		if ok := IsErrIgnored(testCase.err, ignoredErrs...); ok != testCase.ignored {
 			t.Errorf("Test: %d, Expected %t, got %t", i+1, testCase.ignored, ok)
 		}
 	}
@@ -424,7 +425,7 @@ func TestIsErrIgnored(t *testing.T) {
 
 // Test queries()
 func TestQueries(t *testing.T) {
-	testCases := []struct {
+	var testCases = []struct {
 		keys      []string
 		keyvalues []string
 	}{
@@ -445,7 +446,7 @@ func TestQueries(t *testing.T) {
 }
 
 func TestLCP(t *testing.T) {
-	testCases := []struct {
+	var testCases = []struct {
 		prefixes     []string
 		commonPrefix string
 	}{
@@ -484,33 +485,5 @@ func TestGetMinioMode(t *testing.T) {
 
 	globalIsGateway, globalGatewayName = true, "azure"
 	testMinioMode(globalMinioModeGatewayPrefix + globalGatewayName)
-}
 
-func TestTimedValue(t *testing.T) {
-	var cache timedValue
-	t.Parallel()
-	cache.Once.Do(func() {
-		cache.TTL = 2 * time.Second
-		cache.Update = func() (interface{}, error) {
-			return time.Now(), nil
-		}
-	})
-
-	i, _ := cache.Get()
-	t1 := i.(time.Time)
-
-	j, _ := cache.Get()
-	t2 := j.(time.Time)
-
-	if !t1.Equal(t2) {
-		t.Fatalf("expected time to be equal: %s != %s", t1, t2)
-	}
-
-	time.Sleep(3 * time.Second)
-	k, _ := cache.Get()
-	t3 := k.(time.Time)
-
-	if t1.Equal(t3) {
-		t.Fatalf("expected time to be un-equal: %s == %s", t1, t3)
-	}
 }

@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -25,11 +24,10 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"strconv"
 	"testing"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/internal/config/storageclass"
+	"github.com/minio/minio/cmd/config/storageclass"
 )
 
 func TestRepeatPutObjectPart(t *testing.T) {
@@ -111,10 +109,6 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 	for _, test := range testCases {
 		test := test
 		t.Run("", func(t *testing.T) {
-			_, err := xl.GetObjectInfo(ctx, "bucket", "dir/obj", ObjectOptions{})
-			if err != nil {
-				t.Fatal("dir/obj not found before last test")
-			}
 			_, actualErr := xl.DeleteObject(ctx, test.bucket, test.object, ObjectOptions{})
 			if test.expectedErr != nil && actualErr != test.expectedErr {
 				t.Errorf("Expected to fail with %s, but failed with %s", test.expectedErr, actualErr)
@@ -126,86 +120,6 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 	}
 	// Cleanup backend directories
 	removeRoots(fsDirs)
-}
-
-func TestDeleteObjectsVersioned(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	obj, fsDirs, err := prepareErasure(ctx, 16)
-	if err != nil {
-		t.Fatal("Unable to initialize 'Erasure' object layer.", err)
-	}
-	// Remove all dirs.
-	for _, dir := range fsDirs {
-		defer os.RemoveAll(dir)
-	}
-
-	type testCaseType struct {
-		bucket string
-		object string
-	}
-
-	bucketName := "bucket"
-	testCases := []testCaseType{
-		{bucketName, "dir/obj1"},
-		{bucketName, "dir/obj1"},
-	}
-
-	err = obj.MakeBucketWithLocation(ctx, bucketName, BucketOptions{
-		VersioningEnabled: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	names := make([]ObjectToDelete, len(testCases))
-	for i, testCase := range testCases {
-		objInfo, err := obj.PutObject(ctx, testCase.bucket, testCase.object,
-			mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), ObjectOptions{
-				Versioned: true,
-			})
-		if err != nil {
-			t.Fatalf("Erasure Object upload failed: <ERROR> %s", err)
-		}
-		names[i] = ObjectToDelete{
-			ObjectV: ObjectV{
-				ObjectName: objInfo.Name,
-				VersionID:  objInfo.VersionID,
-			},
-		}
-
-	}
-	names = append(names, ObjectToDelete{
-		ObjectV: ObjectV{
-			ObjectName: "dir/obj1",
-			VersionID:  mustGetUUID(), // add a non-existent UUID.
-		},
-	})
-
-	_, delErrs := obj.DeleteObjects(ctx, bucketName, names, ObjectOptions{
-		Versioned: true,
-	})
-	for i := range delErrs {
-		if delErrs[i] != nil {
-			t.Errorf("Failed to remove object `%v` with the error: `%v`", names[i], delErrs[i])
-		}
-	}
-
-	for i, test := range testCases {
-		_, statErr := obj.GetObjectInfo(ctx, test.bucket, test.object, ObjectOptions{
-			VersionID: names[i].ObjectV.VersionID,
-		})
-		switch statErr.(type) {
-		case VersionNotFound:
-		default:
-			t.Fatalf("Object %s is not removed", test.bucket+SlashSeparator+test.object)
-		}
-	}
-
-	if _, err = ioutil.ReadFile(pathJoin(fsDirs[0], bucketName, "dir/obj1", "xl.meta")); err == nil {
-		t.Fatalf("xl.meta still present after removal")
-	}
 }
 
 func TestErasureDeleteObjectsErasureSet(t *testing.T) {
@@ -257,11 +171,7 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 	toObjectNames := func(testCases []testCaseType) []ObjectToDelete {
 		names := make([]ObjectToDelete, len(testCases))
 		for i := range testCases {
-			names[i] = ObjectToDelete{
-				ObjectV: ObjectV{
-					ObjectName: testCases[i].object,
-				},
-			}
+			names[i] = ObjectToDelete{ObjectName: testCases[i].object}
 		}
 		return names
 	}
@@ -286,6 +196,13 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
+	restoreGlobalStorageClass := globalStorageClass
+	defer func() {
+		globalStorageClass = restoreGlobalStorageClass
+	}()
+
+	globalStorageClass = storageclass.Config{}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -315,137 +232,8 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	erasureDisks := xl.getDisks()
-	z.serverPools[0].erasureDisksMu.Lock()
-	xl.getDisks = func() []StorageAPI {
-		for i := range erasureDisks[:6] {
-			erasureDisks[i] = newNaughtyDisk(erasureDisks[i], nil, errFaultyDisk)
-		}
-		return erasureDisks
-	}
-
-	z.serverPools[0].erasureDisksMu.Unlock()
-	_, err = obj.DeleteObject(ctx, bucket, object, ObjectOptions{})
-	if !errors.Is(err, errErasureWriteQuorum) {
-		t.Fatal(err)
-	}
-
-	// Create "obj" under "bucket".
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Remove one more disk to 'lose' quorum, by taking 2 more drives offline.
-	erasureDisks = xl.getDisks()
-	z.serverPools[0].erasureDisksMu.Lock()
-	xl.getDisks = func() []StorageAPI {
-		erasureDisks[7] = nil
-		erasureDisks[8] = nil
-		return erasureDisks
-	}
-
-	z.serverPools[0].erasureDisksMu.Unlock()
-	_, err = obj.DeleteObject(ctx, bucket, object, ObjectOptions{})
-	// since majority of disks are not available, metaquorum is not achieved and hence errErasureWriteQuorum error
-	if !errors.Is(err, errErasureWriteQuorum) {
-		t.Errorf("Expected deleteObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
-	}
-}
-
-func TestErasureDeleteObjectDiskNotFoundErasure4(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Create an instance of xl backend.
-	obj, fsDirs, err := prepareErasure16(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Cleanup backend directories
-	defer obj.Shutdown(context.Background())
-	defer removeRoots(fsDirs)
-
-	z := obj.(*erasureServerPools)
-	xl := z.serverPools[0].sets[0]
-
-	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bucket := "bucket"
-	object := "object"
-	opts := ObjectOptions{}
-	// Create object "obj" under bucket "bucket".
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Upload a good object
-	_, err = obj.DeleteObject(ctx, bucket, object, ObjectOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Create "obj" under "bucket".
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Remove disks to 'lose' quorum for object, by setting 5 to nil.
-	erasureDisks := xl.getDisks()
-	z.serverPools[0].erasureDisksMu.Lock()
-	xl.getDisks = func() []StorageAPI {
-		for i := range erasureDisks[:5] {
-			erasureDisks[i] = newNaughtyDisk(erasureDisks[i], nil, errFaultyDisk)
-		}
-		return erasureDisks
-	}
-
-	z.serverPools[0].erasureDisksMu.Unlock()
-	_, err = obj.DeleteObject(ctx, bucket, object, ObjectOptions{})
-	// since majority of disks are not available, metaquorum is not achieved and hence errErasureWriteQuorum error
-	if !errors.Is(err, errErasureWriteQuorum) {
-		t.Errorf("Expected deleteObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
-	}
-}
-
-func TestErasureDeleteObjectDiskNotFoundErr(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Create an instance of xl backend.
-	obj, fsDirs, err := prepareErasure16(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Cleanup backend directories
-	defer obj.Shutdown(context.Background())
-	defer removeRoots(fsDirs)
-
-	z := obj.(*erasureServerPools)
-	xl := z.serverPools[0].sets[0]
-
-	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bucket := "bucket"
-	object := "object"
-	opts := ObjectOptions{}
-	// Create object "obj" under bucket "bucket".
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// for a 16 disk setup, EC is 4, but will be upgraded up to 8.
-	// Remove 4 disks.
+	// for a 16 disk setup, quorum is 9. To simulate disks not found yet
+	// quorum is available, we remove disks leaving quorum disks behind.
 	erasureDisks := xl.getDisks()
 	z.serverPools[0].erasureDisksMu.Lock()
 	xl.getDisks = func() []StorageAPI {
@@ -467,21 +255,20 @@ func TestErasureDeleteObjectDiskNotFoundErr(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Object was uploaded with 4 known bad drives, so we should still be able to lose 3 drives and still write to the object.
+	// Remove one more disk to 'lose' quorum, by setting it to nil.
 	erasureDisks = xl.getDisks()
 	z.serverPools[0].erasureDisksMu.Lock()
 	xl.getDisks = func() []StorageAPI {
 		erasureDisks[7] = nil
 		erasureDisks[8] = nil
-		erasureDisks[9] = nil
 		return erasureDisks
 	}
 
 	z.serverPools[0].erasureDisksMu.Unlock()
 	_, err = obj.DeleteObject(ctx, bucket, object, ObjectOptions{})
-	// since majority of disks are available, metaquorum achieved.
-	if err != nil {
-		t.Errorf("Expected deleteObject to not fail, but failed with %v", err)
+	// since majority of disks are not available, metaquorum is not achieved and hence errErasureWriteQuorum error
+	if !errors.Is(err, errErasureWriteQuorum) {
+		t.Errorf("Expected deleteObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
 	}
 }
 
@@ -510,7 +297,7 @@ func TestGetObjectNoQuorum(t *testing.T) {
 	bucket := "bucket"
 	object := "object"
 	opts := ObjectOptions{}
-	buf := make([]byte, smallFileThreshold*16)
+	buf := make([]byte, 129<<10)
 	if _, err = io.ReadFull(crand.Reader, buf); err != nil {
 		t.Fatal(err)
 	}
@@ -530,18 +317,9 @@ func TestGetObjectNoQuorum(t *testing.T) {
 		}
 	}
 
-	gr, err := xl.GetObjectNInfo(ctx, bucket, object, nil, nil, readLock, opts)
-	if err != nil {
-		if err != toObjectErr(errErasureReadQuorum, bucket, object) {
-			t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureReadQuorum, bucket, object), err)
-		}
-	}
-	if gr != nil {
-		_, err = io.Copy(ioutil.Discard, gr)
-		if err != toObjectErr(errErasureReadQuorum, bucket, object) {
-			t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureReadQuorum, bucket, object), err)
-		}
-		gr.Close()
+	err = xl.GetObject(ctx, bucket, object, 0, int64(len(buf)), ioutil.Discard, "", opts)
+	if err != toObjectErr(errFileNotFound, bucket, object) {
+		t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
 	}
 
 	// Test use case 2: Make 9 disks offline, which leaves less than quorum number of disks
@@ -575,20 +353,12 @@ func TestGetObjectNoQuorum(t *testing.T) {
 		}
 		z.serverPools[0].erasureDisksMu.Unlock()
 		// Fetch object from store.
-		gr, err := xl.GetObjectNInfo(ctx, bucket, object, nil, nil, readLock, opts)
-		if err != nil {
-			if err != toObjectErr(errErasureReadQuorum, bucket, object) {
-				t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureReadQuorum, bucket, object), err)
-			}
-		}
-		if gr != nil {
-			_, err = io.Copy(ioutil.Discard, gr)
-			if err != toObjectErr(errErasureReadQuorum, bucket, object) {
-				t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureReadQuorum, bucket, object), err)
-			}
-			gr.Close()
+		err = xl.GetObject(ctx, bucket, object, 0, int64(len("abcd")), ioutil.Discard, "", opts)
+		if err != toObjectErr(errErasureReadQuorum, bucket, object) {
+			t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
 		}
 	}
+
 }
 
 func TestHeadObjectNoQuorum(t *testing.T) {
@@ -692,7 +462,7 @@ func TestPutObjectNoQuorum(t *testing.T) {
 	object := "object"
 	opts := ObjectOptions{}
 	// Create "object" under "bucket".
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(bytes.Repeat([]byte{'a'}, smallFileThreshold*16)), smallFileThreshold*16, "", ""), opts)
+	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -700,8 +470,8 @@ func TestPutObjectNoQuorum(t *testing.T) {
 	// Make 9 disks offline, which leaves less than quorum number of disks
 	// in a 16 disk Erasure setup. The original disks are 'replaced' with
 	// naughtyDisks that fail after 'f' successful StorageAPI method
-	// invocations, where f - [0,4)
-	for f := 0; f < 2; f++ {
+	// invocations, where f - [0,3)
+	for f := 0; f < 3; f++ {
 		diskErrors := make(map[int]error)
 		for i := 0; i <= f; i++ {
 			diskErrors[i] = nil
@@ -721,146 +491,10 @@ func TestPutObjectNoQuorum(t *testing.T) {
 		}
 		z.serverPools[0].erasureDisksMu.Unlock()
 		// Upload new content to same object "object"
-		_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(bytes.Repeat([]byte{byte(f)}, smallFileThreshold*16)), smallFileThreshold*16, "", ""), opts)
+		_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), opts)
 		if !errors.Is(err, errErasureWriteQuorum) {
 			t.Errorf("Expected putObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
 		}
-	}
-}
-
-func TestPutObjectNoQuorumSmall(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Create an instance of xl backend.
-	obj, fsDirs, err := prepareErasure16(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
-	defer removeRoots(fsDirs)
-
-	z := obj.(*erasureServerPools)
-	xl := z.serverPools[0].sets[0]
-
-	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bucket := "bucket"
-	object := "object"
-	opts := ObjectOptions{}
-	// Create "object" under "bucket".
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(bytes.Repeat([]byte{'a'}, smallFileThreshold/2)), smallFileThreshold/2, "", ""), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Make 9 disks offline, which leaves less than quorum number of disks
-	// in a 16 disk Erasure setup. The original disks are 'replaced' with
-	// naughtyDisks that fail after 'f' successful StorageAPI method
-	// invocations, where f - [0,2)
-	for f := 0; f < 2; f++ {
-		t.Run("exec-"+strconv.Itoa(f), func(t *testing.T) {
-			diskErrors := make(map[int]error)
-			for i := 0; i <= f; i++ {
-				diskErrors[i] = nil
-			}
-			erasureDisks := xl.getDisks()
-			for i := range erasureDisks[:9] {
-				switch diskType := erasureDisks[i].(type) {
-				case *naughtyDisk:
-					erasureDisks[i] = newNaughtyDisk(diskType.disk, diskErrors, errFaultyDisk)
-				default:
-					erasureDisks[i] = newNaughtyDisk(erasureDisks[i], diskErrors, errFaultyDisk)
-				}
-			}
-			z.serverPools[0].erasureDisksMu.Lock()
-			xl.getDisks = func() []StorageAPI {
-				return erasureDisks
-			}
-			z.serverPools[0].erasureDisksMu.Unlock()
-			// Upload new content to same object "object"
-			_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(bytes.Repeat([]byte{byte(f)}, smallFileThreshold/2)), smallFileThreshold/2, "", ""), opts)
-			if !errors.Is(err, errErasureWriteQuorum) {
-				t.Errorf("Expected putObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
-			}
-		})
-	}
-}
-
-// Test PutObject twice, one small and another bigger
-// than small data thresold and checks reading them again
-func TestPutObjectSmallInlineData(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	const numberOfDisks = 4
-
-	// Create an instance of xl backend.
-	obj, fsDirs, err := prepareErasure(ctx, numberOfDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
-	defer removeRoots(fsDirs)
-
-	bucket := "bucket"
-	object := "object"
-
-	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Test: Upload a small file and read it.
-	smallData := []byte{'a'}
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(smallData), int64(len(smallData)), "", ""), ObjectOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gr, err := obj.GetObjectNInfo(ctx, bucket, object, nil, nil, readLock, ObjectOptions{})
-	if err != nil {
-		t.Fatalf("Expected GetObject to succeed, but failed with %v", err)
-	}
-	output := bytes.NewBuffer([]byte{})
-	_, err = io.Copy(output, gr)
-	if err != nil {
-		t.Fatalf("Expected GetObject reading data to succeed, but failed with %v", err)
-	}
-	gr.Close()
-	if !bytes.Equal(output.Bytes(), smallData) {
-		t.Fatalf("Corrupted data is found")
-	}
-
-	// Test: Upload a file bigger than the small file threshold
-	// under the same bucket & key name and try to read it again.
-
-	output.Reset()
-	bigData := bytes.Repeat([]byte{'b'}, smallFileThreshold*numberOfDisks/2)
-
-	_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(bigData), int64(len(bigData)), "", ""), ObjectOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	gr, err = obj.GetObjectNInfo(ctx, bucket, object, nil, nil, readLock, ObjectOptions{})
-	if err != nil {
-		t.Fatalf("Expected GetObject to succeed, but failed with %v", err)
-	}
-	_, err = io.Copy(output, gr)
-	if err != nil {
-		t.Fatalf("Expected GetObject reading data to succeed, but failed with %v", err)
-	}
-	gr.Close()
-	if !bytes.Equal(output.Bytes(), bigData) {
-		t.Fatalf("Corrupted data found")
 	}
 }
 
@@ -869,6 +503,13 @@ func TestObjectQuorumFromMeta(t *testing.T) {
 }
 
 func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []string, t TestErrHandler) {
+	restoreGlobalStorageClass := globalStorageClass
+	defer func() {
+		globalStorageClass = restoreGlobalStorageClass
+	}()
+
+	globalStorageClass = storageclass.Config{}
+
 	bucket := getRandomBucketName()
 
 	var opts ObjectOptions

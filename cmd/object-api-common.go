@@ -1,43 +1,35 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016-2019 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
 import (
 	"context"
-	"strings"
+	"errors"
 	"sync"
 
-	"github.com/dustin/go-humanize"
-	"github.com/minio/minio/internal/sync/errgroup"
+	"strings"
+
+	humanize "github.com/dustin/go-humanize"
+	"github.com/minio/minio/cmd/logger"
 )
 
 const (
 	// Block size used for all internal operations version 1.
-
-	// TLDR..
-	// Not used anymore xl.meta captures the right blockSize
-	// so blockSizeV2 should be used for all future purposes.
-	// this value is kept here to calculate the max API
-	// requests based on RAM size for existing content.
 	blockSizeV1 = 10 * humanize.MiByte
-
-	// Block size used in erasure coding version 2.
-	blockSizeV2 = 1 * humanize.MiByte
 
 	// Buckets meta prefix.
 	bucketMetaPrefix = "buckets"
@@ -52,7 +44,7 @@ var globalObjLayerMutex sync.RWMutex
 // Global object layer, only accessed by globalObjectAPI.
 var globalObjectAPI ObjectLayer
 
-// Global cacheObjects, only accessed by newCacheObjectsFn().
+//Global cacheObjects, only accessed by newCacheObjectsFn().
 var globalCacheObjectAPI CacheObjectLayer
 
 // Checks if the object is a directory, this logic uses
@@ -68,7 +60,7 @@ func newStorageAPIWithoutHealthCheck(endpoint Endpoint) (storage StorageAPI, err
 		if err != nil {
 			return nil, err
 		}
-		return newXLStorageDiskIDCheck(storage), nil
+		return &xlStorageDiskIDCheck{storage: storage}, nil
 	}
 
 	return newStorageRESTClient(endpoint, false), nil
@@ -81,10 +73,76 @@ func newStorageAPI(endpoint Endpoint) (storage StorageAPI, err error) {
 		if err != nil {
 			return nil, err
 		}
-		return newXLStorageDiskIDCheck(storage), nil
+		return &xlStorageDiskIDCheck{storage: storage}, nil
 	}
 
 	return newStorageRESTClient(endpoint, true), nil
+}
+
+// Cleanup a directory recursively.
+func cleanupDir(ctx context.Context, storage StorageAPI, volume, dirPath string) error {
+	var delFunc func(string) error
+	// Function to delete entries recursively.
+	delFunc = func(entryPath string) error {
+		if !HasSuffix(entryPath, SlashSeparator) {
+			// Delete the file entry.
+			err := storage.Delete(ctx, volume, entryPath, false)
+			if !IsErrIgnored(err, []error{
+				errDiskNotFound,
+				errUnformattedDisk,
+				errFileNotFound,
+			}...) {
+				logger.LogIf(ctx, err)
+			}
+			return err
+		}
+
+		// If it's a directory, list and call delFunc() for each entry.
+		entries, err := storage.ListDir(ctx, volume, entryPath, -1)
+		// If entryPath prefix never existed, safe to ignore
+		if errors.Is(err, errFileNotFound) {
+			return nil
+		} else if err != nil { // For any other errors fail.
+			if !IsErrIgnored(err, []error{
+				errDiskNotFound,
+				errUnformattedDisk,
+				errFileNotFound,
+			}...) {
+				logger.LogIf(ctx, err)
+			}
+			return err
+		} // else on success..
+
+		// Entry path is empty, just delete it.
+		if len(entries) == 0 {
+			err = storage.Delete(ctx, volume, entryPath, false)
+			if !IsErrIgnored(err, []error{
+				errDiskNotFound,
+				errUnformattedDisk,
+				errFileNotFound,
+			}...) {
+				logger.LogIf(ctx, err)
+			}
+			return err
+		}
+
+		// Recurse and delete all other entries.
+		for _, entry := range entries {
+			if err = delFunc(pathJoin(entryPath, entry)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	err := delFunc(retainSlash(pathJoin(dirPath)))
+	if IsErrIgnored(err, []error{
+		errVolumeNotFound,
+		errVolumeAccessDenied,
+	}...) {
+		return nil
+	}
+	return err
 }
 
 func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
@@ -164,8 +222,6 @@ func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter 
 		result.IsTruncated = true
 		if len(objInfos) > 0 {
 			result.NextMarker = objInfos[len(objInfos)-1].Name
-		} else if len(result.Prefixes) > 0 {
-			result.NextMarker = result.Prefixes[len(result.Prefixes)-1]
 		}
 	}
 
@@ -249,21 +305,6 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		return loi, nil
 	}
 
-	if len(prefix) > 0 && maxKeys == 1 && delimiter == "" && marker == "" {
-		// Optimization for certain applications like
-		// - Cohesity
-		// - Actifio, Splunk etc.
-		// which send ListObjects requests where the actual object
-		// itself is the prefix and max-keys=1 in such scenarios
-		// we can simply verify locally if such an object exists
-		// to avoid the need for ListObjects().
-		objInfo, err := obj.GetObjectInfo(ctx, bucket, prefix, ObjectOptions{NoLock: true})
-		if err == nil {
-			loi.Objects = append(loi.Objects, objInfo)
-			return loi, nil
-		}
-	}
-
 	// For delimiter and prefix as '/' we do not list anything at all
 	// since according to s3 spec we stop at the 'delimiter'
 	// along // with the prefix. On a flat namespace with 'prefix'
@@ -290,96 +331,58 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
 	}
 
+	var objInfos []ObjectInfo
 	var eof bool
 	var nextMarker string
 
-	maxConcurrent := maxKeys / 10
-	if maxConcurrent == 0 {
-		maxConcurrent = maxKeys
-	}
-
 	// List until maxKeys requested.
-	g := errgroup.WithNErrs(maxKeys).WithConcurrency(maxConcurrent)
-
-	objInfoFound := make([]*ObjectInfo, maxKeys)
-	var i int
-	for i = 0; i < maxKeys; i++ {
-		i := i
+	for i := 0; i < maxKeys; {
 		walkResult, ok := <-walkResultCh
 		if !ok {
-			if HasSuffix(prefix, SlashSeparator) {
-				objInfo, err := obj.GetObjectInfo(ctx, bucket, prefix, ObjectOptions{NoLock: true})
-				if err == nil {
-					loi.Objects = append(loi.Objects, objInfo)
-					return loi, nil
-				}
-			}
 			// Closed channel.
 			eof = true
 			break
 		}
 
+		var objInfo ObjectInfo
+		var err error
 		if HasSuffix(walkResult.entry, SlashSeparator) {
-			g.Go(func() error {
-				for _, getObjectInfoDir := range getObjectInfoDirs {
-					objInfo, err := getObjectInfoDir(ctx, bucket, walkResult.entry)
-					if err == nil {
-						objInfoFound[i] = &objInfo
-						// Done...
-						return nil
-					}
-
-					// Add temp, may be overridden,
-					if err == errFileNotFound {
-						objInfoFound[i] = &ObjectInfo{
-							Bucket: bucket,
-							Name:   walkResult.entry,
-							IsDir:  true,
-						}
-						continue
-					}
-					return toObjectErr(err, bucket, prefix)
+			for _, getObjectInfoDir := range getObjectInfoDirs {
+				objInfo, err = getObjectInfoDir(ctx, bucket, walkResult.entry)
+				if err == nil {
+					break
 				}
-				return nil
-			}, i)
+				if err == errFileNotFound {
+					err = nil
+					objInfo = ObjectInfo{
+						Bucket: bucket,
+						Name:   walkResult.entry,
+						IsDir:  true,
+					}
+				}
+			}
 		} else {
-			g.Go(func() error {
-				objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
-				if err != nil {
-					// Ignore errFileNotFound as the object might have got
-					// deleted in the interim period of listing and getObjectInfo(),
-					// ignore quorum error as it might be an entry from an outdated disk.
-					if IsErrIgnored(err, []error{
-						errFileNotFound,
-						errErasureReadQuorum,
-					}...) {
-						return nil
-					}
-					return toObjectErr(err, bucket, prefix)
-				}
-				objInfoFound[i] = &objInfo
-				return nil
-			}, i)
+			objInfo, err = getObjInfo(ctx, bucket, walkResult.entry)
 		}
-
+		if err != nil {
+			// Ignore errFileNotFound as the object might have got
+			// deleted in the interim period of listing and getObjectInfo(),
+			// ignore quorum error as it might be an entry from an outdated disk.
+			if IsErrIgnored(err, []error{
+				errFileNotFound,
+				errErasureReadQuorum,
+			}...) {
+				continue
+			}
+			return loi, toObjectErr(err, bucket, prefix)
+		}
+		nextMarker = objInfo.Name
+		objInfos = append(objInfos, objInfo)
 		if walkResult.end {
 			eof = true
 			break
 		}
-	}
-	for _, err := range g.Wait() {
-		if err != nil {
-			return loi, err
-		}
-	}
-	// Copy found objects
-	objInfos := make([]ObjectInfo, 0, i+1)
-	for _, objInfo := range objInfoFound {
-		if objInfo == nil {
-			continue
-		}
-		objInfos = append(objInfos, *objInfo)
-		nextMarker = objInfo.Name
+		i++
 	}
 
 	// Save list routine for the next marker if we haven't reached EOF.
@@ -401,8 +404,6 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		result.IsTruncated = true
 		if len(objInfos) > 0 {
 			result.NextMarker = objInfos[len(objInfos)-1].Name
-		} else if len(result.Prefixes) > 0 {
-			result.NextMarker = result.Prefixes[len(result.Prefixes)-1]
 		}
 	}
 

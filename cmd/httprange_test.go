@@ -1,19 +1,18 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
-//
-// This file is part of MinIO Object Storage stack
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package cmd
 
@@ -99,48 +98,5 @@ func TestHTTPRequestRangeSpec(t *testing.T) {
 			continue
 		}
 		t.Errorf("Case %d: Expected errInvalidRange but: %v %v %d %d %v", i, rs, err1, o, l, err2)
-	}
-}
-
-func TestHTTPRequestRangeToHeader(t *testing.T) {
-	validRangeSpecs := []struct {
-		spec        string
-		errExpected bool
-	}{
-		{"bytes=0-", false},
-		{"bytes=1-", false},
-
-		{"bytes=0-9", false},
-		{"bytes=1-10", false},
-		{"bytes=1-1", false},
-		{"bytes=2-5", false},
-
-		{"bytes=-5", false},
-		{"bytes=-1", false},
-		{"bytes=-1000", false},
-		{"bytes=", true},
-		{"bytes= ", true},
-		{"byte=", true},
-		{"bytes=A-B", true},
-		{"bytes=1-B", true},
-		{"bytes=B-1", true},
-		{"bytes=-1-1", true},
-	}
-	for i, testCase := range validRangeSpecs {
-		rs, err := parseRequestRangeSpec(testCase.spec)
-		if err != nil {
-			if !testCase.errExpected || err == nil && testCase.errExpected {
-				t.Errorf("unexpected err: %v", err)
-			}
-			continue
-		}
-		h, err := rs.ToHeader()
-		if err != nil && !testCase.errExpected || err == nil && testCase.errExpected {
-			t.Errorf("expected error with invalid range: %v", err)
-		}
-		if h != testCase.spec {
-			t.Errorf("Case %d: translated to incorrect header: %s expected: %s",
-				i, h, testCase.spec)
-		}
 	}
 }
