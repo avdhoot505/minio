@@ -7,7 +7,13 @@ ENV PATH $PATH:$GOPATH/bin
 ENV CGO_ENABLED 0
 ENV MINIO_UPDATE off
 ENV MINIO_ACCESS_KEY_FILE=access_key \
-    MINIO_SECRET_KEY_FILE=secret_key
+    MINIO_SECRET_KEY_FILE=secret_key \
+    MINIO_KMS_MASTER_KEY_FILE=kms_master_key \
+    MINIO_SSE_MASTER_KEY_FILE=sse_master_key \
+    MINIO_CONFIG_ENV_FILE=config_env_file \
+    MINIO_SITE_NAME=site_name \
+    MINIO_SITE_REGION=site_region \
+    MINIO_SERVER_URL=server_url 
 
 WORKDIR /go/src/github.com/avdhoot505/minio/
 
